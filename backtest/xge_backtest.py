@@ -83,7 +83,7 @@ def atr_wilder(h, l, c, n=14):
     return out
 
 
-def load_data():
+def load_data(tf="m15"):
     df = pd.read_csv(DATA, sep="\t",
                      names=["date", "time", "open", "high", "low", "close", "tickvol", "vol", "spread"],
                      header=0)
@@ -91,11 +91,14 @@ def load_data():
     m5 = pd.DataFrame({"open": df["open"].values, "high": df["high"].values,
                        "low": df["low"].values, "close": df["close"].values,
                        "spread": df["spread"].values * 0.001}, index=ts).sort_index()
-    m15 = m5.resample("15min").agg({"open": "first", "high": "max", "low": "min",
-                                    "close": "last", "spread": "mean"}).dropna()
+    if tf == "m5":
+        entry = m5
+    else:
+        entry = m5.resample("15min").agg({"open": "first", "high": "max", "low": "min",
+                                          "close": "last", "spread": "mean"}).dropna()
     h1 = m5.resample("1h").agg({"open": "first", "high": "max", "low": "min",
                                 "close": "last"}).dropna()
-    return m15, h1
+    return entry, h1
 
 
 class Market:
@@ -506,17 +509,64 @@ def stats(res):
     daily = eq.resample("1D").last().dropna()
     dret = daily.pct_change().dropna()
     sharpe = (dret.mean() / dret.std() * math.sqrt(252)) if len(dret) and dret.std() > 0 else 0
+
+    ext = {}
+    if len(tr):
+        wstreak = lstreak = wmx = 0
+        for p in tr.pnl:
+            if p > 0:
+                wstreak += 1; lstreak = 0
+            else:
+                lstreak += 1; wstreak = 0
+            wmx = max(wmx, wstreak)
+        bt = tr.loc[tr.pnl.idxmax()]; wt = tr.loc[tr.pnl.idxmin()]
+        ext["best_trade"] = (bt.pnl, bt.entry_time, bt.exit_time, bt["dir"], bt["mode"], bt["why"])
+        ext["worst_trade"] = (wt.pnl, wt.entry_time, wt.exit_time, wt["dir"], wt["mode"], wt["why"])
+        hold_min = pd.Series((pd.DatetimeIndex(tr.exit_time) - pd.DatetimeIndex(tr.entry_time))
+                             .total_seconds() / 60.0)
+        ext["hold_avg_min"] = float(hold_min.mean())
+        ext["hold_med_min"] = float(hold_min.median())
+        ext["hold_max_min"] = float(hold_min.max())
+        ext["win_streak"] = wmx
+        byd = tr.assign(day=pd.DatetimeIndex(tr.exit_time).strftime("%Y-%m-%d")).groupby("day").pnl.sum()
+        ext["best_day"] = (byd.max(), byd.idxmax())
+        ext["worst_day"] = (byd.min(), byd.idxmin())
+        dpl = daily.diff().dropna()
+        ext["best_close_day"] = (dpl.max(), dpl.idxmax())
+        ext["worst_close_day"] = (dpl.min(), dpl.idxmin())
+        bymo = tr.assign(mo=pd.DatetimeIndex(tr.exit_time).strftime("%Y-%m")).groupby("mo").pnl.sum()
+        ext["best_month"] = (bymo.max(), bymo.idxmax())
+        ext["worst_month"] = (bymo.min(), bymo.idxmin())
+        buys = tr[tr["dir"] == 1]; sells = tr[tr["dir"] == -1]
+        ext["buy_pnl"] = (buys.pnl.sum() if len(buys) else 0.0, len(buys))
+        ext["sell_pnl"] = (sells.pnl.sum() if len(sells) else 0.0, len(sells))
+        ext["median_trade"] = float(tr.pnl.median())
+        ext["expectancy"] = float(tr.pnl.mean())
+        ext["max_dd_dollars"] = float((eq.cummax() - eq).max())
+        ext["peak_equity"] = float(eq.max())
+        ext["trough_equity"] = float(eq.min())
     return dict(net=net, final=final, pf=pf, wr=wr, avgw=avgw, avgl=avgl,
-                maxdd=maxdd, trades=len(tr), streak=mx, sharpe=sharpe, eq=eq, dd=dd, rows=tr)
+                maxdd=maxdd, trades=len(tr), streak=mx, sharpe=sharpe, eq=eq, dd=dd,
+                rows=tr, **ext)
 
 
 def main():
+    import sys
+    tf = sys.argv[1] if len(sys.argv) > 1 else "m15"
+    assert tf in ("m5", "m15")
+    preset = sys.argv[2] if len(sys.argv) > 2 else ""
+    if preset == "rt":
+        # real-time-equivalent windows: scale bar-based params 3x (M15 -> M5)
+        P.update(dict(swing_fresh=9, swing_lookback=360, range_lookback=270,
+                      same_setup_bars=72, atr_avg_bars=600, swing_strength=9))
+        print("preset rt: bar-based windows scaled x3 for real-time equivalence")
+    suffix = "" if tf == "m15" else ("_m5" if preset == "" else f"_m5_{preset}")
     print("Loading data...")
-    m15, h1 = load_data()
-    end = m15.index[-1]
+    ent, h1 = load_data(tf)
+    end = ent.index[-1]
     eval_start = (end - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
-    print(f"Eval window: {eval_start} .. {end.strftime('%Y-%m-%d')} | M15 bars {len(m15)}")
-    m = Market(m15, h1)
+    print(f"Eval window: {eval_start} .. {end.strftime('%Y-%m-%d')} | {tf.upper()} bars {len(ent)}")
+    m = Market(ent, h1)
     import time as _t
     t0 = _t.time()
     res = run(m, eval_start)
@@ -531,19 +581,26 @@ def main():
         tr_out["exit_time"] = pd.DatetimeIndex(tr_out["exit_time"]).strftime("%Y-%m-%d %H:%M")
         tr_out["mode"] = tr_out["mode"].map(MODE_TXT)
         tr_out["dir"] = tr_out["dir"].map({1: "BUY", -1: "SELL"})
-        tr_out.to_csv(f"{OUT}/backtest_trades.csv", index=False)
+        tr_out.to_csv(f"{OUT}/backtest_trades{suffix}.csv", index=False)
     recon = P["start_balance"] + (tr.pnl.sum() if len(tr) else 0)
     print(f"RECON: {recon:,.2f} vs {st['final']:,.2f} diff {st['final']-recon:+.2f}")
 
+    def fmt_tr(info):
+        pnl, e, x, d, mo, why = info
+        return (f"${pnl:+,.2f} | {pd.Timestamp(e):%Y-%m-%d %H:%M} -> "
+                f"{pd.Timestamp(x):%H:%M} | {'BUY' if d == 1 else 'SELL'} | "
+                f"{MODE_TXT[mo]} | exit: {why}")
+
     L = []
-    L.append("# XGE v2 Backtest Report - XAUUSD 1 Year")
+    L.append(f"# XGE v2 Backtest Report ({tf.upper()}) - XAUUSD 1 Year")
     L.append("")
-    L.append(f"- Data: XAUUSD M5 (XM) resampled M15; window **{eval_start} .. {end.strftime('%Y-%m-%d')}**, warm-up on prior history")
+    dsrc = "native M5" if tf == "m5" else "M5 resampled to M15"
+    L.append(f"- Data: XAUUSD ({dsrc}, XM broker); window **{eval_start} .. {end.strftime('%Y-%m-%d')}**, warm-up on prior history")
     L.append("- v2 rules: ONLY low-vol = no trade. Uptrend: buy HL exit HH. Downtrend: sell LH exit LL.")
     L.append("  Side: support/resistance. News: momentum + rolling trailing stop-and-reverse (max 3 flips).")
     L.append(f"- Start ${P['start_balance']:,.0f}, risk {P['risk_pct']}%/trade "
              f"({P['risk_pct'] * P['dd_risk_mult']:.1f}% while recovering from a DD halt), "
-             f"real broker spread (avg {m15['spread'].mean():.2f})")
+             f"real broker spread (avg {ent['spread'].mean():.2f})")
     L.append(f"- DD breaker: at {P['max_dd_pct']}% halt {P['dd_halt_days']} days, then resume at reduced risk until full recovery")
     L.append("")
     L.append("## Results")
@@ -560,6 +617,31 @@ def main():
     L.append(f"| Longest losing streak | {st['streak']} |")
     L.append(f"| Sharpe (daily) | {st['sharpe']:.2f} |")
     L.append("")
+    if len(tr):
+        L.append("## Extremes (সর্বোচ্চ লাভ / সর্বোচ্চ লস)")
+        L.append("")
+        L.append("| Item | Detail |")
+        L.append("|---|---|")
+        L.append(f"| Single best trade (সর্বোচ্চ লাভ) | {fmt_tr(st['best_trade'])} |")
+        L.append(f"| Single worst trade (সর্বোচ্চ লস) | {fmt_tr(st['worst_trade'])} |")
+        bp, bd = st["best_day"]; wp, wd = st["worst_day"]
+        L.append(f"| Best trading day | {bp:+,.2f} on {bd} |")
+        L.append(f"| Worst trading day | {wp:+,.2f} on {wd} |")
+        bcp, bcd = st["best_close_day"]; wcp, wcd = st["worst_close_day"]
+        L.append(f"| Best close-to-close day | {bcp:+,.2f} on {bcd.strftime('%Y-%m-%d')} |")
+        L.append(f"| Worst close-to-close day | {wcp:+,.2f} on {wcd.strftime('%Y-%m-%d')} |")
+        bmp, bm = st["best_month"]; wmp, wm = st["worst_month"]
+        L.append(f"| Best month | {bmp:+,.2f} ({bm}) |")
+        L.append(f"| Worst month | {wmp:+,.2f} ({wm}) |")
+        L.append(f"| Peak equity | ${st['peak_equity']:,.2f} |")
+        L.append(f"| Lowest equity | ${st['trough_equity']:,.2f} |")
+        L.append(f"| Max drawdown | {st['maxdd']:.2f}% (${st['max_dd_dollars']:,.2f}) |")
+        L.append(f"| Longest winning streak | {st['win_streak']} |")
+        L.append(f"| BUY total / SELL total | {st['buy_pnl'][0]:+,.2f} ({st['buy_pnl'][1]} trades) / {st['sell_pnl'][0]:+,.2f} ({st['sell_pnl'][1]} trades) |")
+        L.append(f"| Median trade | ${st['median_trade']:+,.2f} |")
+        L.append(f"| Expectancy per trade | ${st['expectancy']:+,.2f} |")
+        L.append(f"| Hold time (avg / median / max) | {st['hold_avg_min']:.0f} / {st['hold_med_min']:.0f} / {st['hold_max_min']:.0f} min |")
+        L.append("")
     if len(tr):
         rows = st["rows"].copy()
         rows["mode_txt"] = rows["mode"].map(MODE_TXT)
@@ -602,7 +684,7 @@ def main():
     L.append("")
     L.append("> Disclaimer: simulated approximation of the MT5 EA. Validate in the MT5 Strategy")
     L.append("> Tester (every tick, real ticks) before live use.")
-    open(f"{OUT}/REPORT.md", "w").write("\n".join(L))
+    open(f"{OUT}/REPORT{suffix}.md", "w").write("\n".join(L))
     print("\n".join(L))
 
     import matplotlib
@@ -610,7 +692,7 @@ def main():
     import matplotlib.pyplot as plt
     eq = st["eq"]
     i0t = pd.Timestamp(res["t"][res["i0"]])
-    price = m15["close"].loc[i0t:].resample("1h").last()
+    price = ent["close"].loc[i0t:].resample("1h").last()
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True,
                              gridspec_kw={"height_ratios": [3, 2, 1.2]})
     axes[0].plot(price.index, price.values, lw=0.6, color="#888")
@@ -618,7 +700,7 @@ def main():
         b = tr[tr.dir == 1]; s = tr[tr.dir == -1]
         axes[0].scatter(pd.DatetimeIndex(b.entry_time), b.entry, marker="^", s=26, color="tab:green", zorder=3)
         axes[0].scatter(pd.DatetimeIndex(s.entry_time), s.entry, marker="v", s=26, color="tab:red", zorder=3)
-    axes[0].set_title("XAUUSD M15 v2 entries (1 year)")
+    axes[0].set_title(f"XAUUSD {tf.upper()} v2 entries (1 year)")
     axes[0].grid(alpha=0.25)
     axes[1].plot(eq.index, eq.values, lw=1.0, color="tab:blue")
     axes[1].axhline(P["start_balance"], color="k", lw=0.6, ls="--")
@@ -628,7 +710,7 @@ def main():
     axes[2].set_title(f"Drawdown (max {st['maxdd']:.2f}%)")
     axes[2].grid(alpha=0.25)
     plt.tight_layout()
-    plt.savefig(f"{OUT}/equity_curve.png", dpi=110)
+    plt.savefig(f"{OUT}/equity_curve{suffix}.png", dpi=110)
     print(f"saved to {OUT}/")
 
 

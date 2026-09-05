@@ -1,6 +1,6 @@
-# XGE v2 Backtest Report - XAUUSD 1 Year
+# XGE v2 Backtest Report (M15) - XAUUSD 1 Year
 
-- Data: XAUUSD M5 (XM) resampled M15; window **2025-08-21 .. 2026-08-21**, warm-up on prior history
+- Data: XAUUSD (M5 resampled to M15, XM broker); window **2025-08-21 .. 2026-08-21**, warm-up on prior history
 - v2 rules: ONLY low-vol = no trade. Uptrend: buy HL exit HH. Downtrend: sell LH exit LL.
   Side: support/resistance. News: momentum + rolling trailing stop-and-reverse (max 3 flips).
 - Start $10,000, risk 1.0%/trade (0.5% while recovering from a DD halt), real broker spread (avg 0.20)
@@ -19,6 +19,27 @@
 | Max drawdown | 26.25% |
 | Longest losing streak | 11 |
 | Sharpe (daily) | 0.60 |
+
+## Extremes (সর্বোচ্চ লাভ / সর্বোচ্চ লস)
+
+| Item | Detail |
+|---|---|
+| Single best trade (সর্বোচ্চ লাভ) | $+922.99 | 2025-08-22 13:30 -> 14:45 | BUY | NEWS | exit: NEWS_END |
+| Single worst trade (সর্বোচ্চ লস) | $-145.15 | 2025-11-19 11:45 -> 13:00 | BUY | UPTREND | exit: SL |
+| Best trading day | +1,075.05 on 2025-08-22 |
+| Worst trading day | -561.15 on 2025-11-20 |
+| Best close-to-close day | +1,074.89 on 2025-08-22 |
+| Worst close-to-close day | -561.15 on 2025-11-20 |
+| Best month | +1,336.13 (2025-08) |
+| Worst month | -1,110.78 (2025-12) |
+| Peak equity | $15,042.27 |
+| Lowest equity | $9,872.78 |
+| Max drawdown | 26.25% ($3,948.67) |
+| Longest winning streak | 7 |
+| BUY total / SELL total | +1,430.54 (1013 trades) / +291.39 (930 trades) |
+| Median trade | $-7.43 |
+| Expectancy per trade | $+0.89 |
+| Hold time (avg / median / max) | 67 / 45 / 1770 min |
 
 ## Monthly
 
