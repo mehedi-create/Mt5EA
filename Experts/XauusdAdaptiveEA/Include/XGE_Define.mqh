@@ -75,6 +75,29 @@ enum ENUM_SIGNAL_DIR
    SIG_SELL
   };
 
+//--- v2 operating modes: only LOW_VOL stays out of the market
+enum ENUM_MODE
+  {
+   MODE_NOVOL = 0,   // low volatility -> the only NO-TRADE state
+   MODE_NEWS,        // news time: momentum + trailing + stop-and-reverse
+   MODE_UP,          // uptrend: buy higher-low, close at higher-high
+   MODE_DOWN,        // downtrend: sell lower-high, close at lower-low
+   MODE_SIDE         // sideways: buy support / sell resistance
+  };
+
+string ModeText(const ENUM_MODE m)
+  {
+   switch(m)
+     {
+      case MODE_NOVOL: return "LOW VOL - NO TRADE";
+      case MODE_NEWS:  return "NEWS - momentum+trailing";
+      case MODE_UP:    return "UPTREND - buy HL / exit HH";
+      case MODE_DOWN:  return "DOWNTREND - sell LH / exit LL";
+      case MODE_SIDE:  return "SIDE - S/R trading";
+     }
+   return "?";
+  }
+
 struct SSwing
   {
    int      bar;      // bar index in series (0 = current)
@@ -118,6 +141,7 @@ struct SMarketState
    int      shCount, slCount;
    SSwing   sh[4];                   // swing highs, [0] = most recent
    SSwing   sl[4];                   // swing lows
+   int      sh0Age, sl0Age;          // bars since newest swing got confirmed
    bool     bullBOS, bearBOS;        // break of structure events
    int      bullBOSBar, bearBOSBar;  // bars ago
    bool     chochBull, chochBear;    // change of character

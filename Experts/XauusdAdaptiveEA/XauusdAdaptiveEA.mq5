@@ -1,25 +1,27 @@
 //+------------------------------------------------------------------+
 //|                                            XauusdAdaptiveEA.mq5 |
-//|                 XAUUSD Adaptive Pro EA - main module             |
+//|                 XAUUSD Adaptive Pro EA - v2 main module          |
 //|                                                                  |
-//| Design principle:                                                |
-//|   GOOD MARKET      -> TRADE                                      |
-//|   BAD MARKET       -> NO TRADE                                   |
-//|   UNCERTAIN MARKET -> WAIT                                       |
-//|   DANGEROUS MARKET -> PROTECT CAPITAL                            |
+//| v2 design (user direction):                                      |
+//|   - ONLY low volatility means NO TRADE. Every other market state |
+//|     is traded with a regime-specific behaviour.                  |
+//|   - UPTREND  : buy at fresh Higher-Low, close at Higher-High     |
+//|   - DOWNTREND: sell at fresh Lower-High, close at Lower-Low      |
+//|   - SIDE     : buy support / sell resistance                     |
+//|   - NEWS     : trade the probable direction with a rolling       |
+//|     trailing stop; when the trailing stop is hit, reverse into   |
+//|     the opposite trade with a new rolling trailing stop.         |
 //|                                                                  |
-//| "Every market movement is NOT a trading opportunity."            |
+//| Capital protection layers (risk sizing, daily/weekly limits,     |
+//| max-DD halt, cooldowns, spread guard) stay active at all times.  |
 //|                                                                  |
-//| Not a holy grail: losses and drawdowns are a normal part of      |
-//| trading. The EA focuses on selective high-quality setups and     |
-//| strict capital protection.                                       |
+//| Not a holy grail - losses and drawdowns are part of trading.     |
 //+------------------------------------------------------------------+
 #property copyright   "XGE Project"
 #property link        ""
-#property version     "1.00"
-#property description "Adaptive multi-strategy EA for XAUUSD (Gold)."
-#property description "Classifies market condition, selects matching strategy,"
-#property description "trades only high-quality setups, protects capital first."
+#property version     "2.00"
+#property description "XAUUSD Adaptive Pro EA v2: regime-based structure trading."
+#property description "Trades all market states except low volatility."
 
 #include "Include\XGE_Define.mqh"
 #include "Include\XGE_Market.mqh"
@@ -38,24 +40,17 @@ input bool              InpAllowSell      = true;         // Allow SELL trades
 
 //=== Timeframes =====================================================
 input group "=== Timeframes ==="
-input ENUM_TIMEFRAMES   InpHTF            = PERIOD_H1;    // Higher TF (context)
+input ENUM_TIMEFRAMES   InpHTF            = PERIOD_H1;    // Higher TF (context/bias)
 input ENUM_TIMEFRAMES   InpEntryTF        = PERIOD_M15;   // Entry TF (signals)
 
-//=== Strategies =====================================================
-input group "=== Strategies ==="
-input bool              InpUseTrend       = true;         // Use Trend-Follow strategy
-input bool              InpUsePullback    = true;         // Use Pullback strategy
-input bool              InpUseBreakout    = true;         // Use Breakout strategy
-input bool              InpUseRetest      = true;         // Use Breakout-Retest strategy
-input bool              InpUseRange       = true;         // Use Range strategy
-input bool              InpUseReversal    = false;        // Use Reversal strategy (aggressive)
-input bool              InpUseSweep       = true;         // Use Liquidity-Sweep strategy
-input bool              InpEnforceHTF     = true;         // Block trades against HTF trend
-input bool              InpAllowCounter   = false;        // Allow counter-trend setups
-input double            InpMinConfidence  = 62.0;         // Minimum confidence 0-100
-input double            InpMinRR          = 1.2;          // Minimum risk:reward
-input double            InpRRTP           = 1.8;          // Take profit in R multiples
-input double            InpRevMinConf     = 70.0;         // Reversal score threshold
+//=== Regime trading =================================================
+input group "=== Regime Trading ==="
+input int               InpSwingFresh     = 3;            // Max age of a fresh swing (bars)
+input bool              InpUseNewsMode    = true;         // Enable news stop-and-reverse mode
+input double            InpNewsTrailATR   = 1.2;          // News trailing stop (xATR)
+input double            InpNewsMomentumATR= 0.4;          // News momentum candle (xATR body)
+input int               InpNewsMaxReversals= 3;           // Max stop-and-reverse flips per news window
+input double            InpEmergencyATR   = 5.0;          // Emergency exit at adverse xATR
 
 //=== Risk ===========================================================
 input group "=== Risk ==="
@@ -64,61 +59,44 @@ input double            InpFixedLot       = 0.0;          // Fixed lot (0 = use 
 input double            InpMaxLot         = 10.0;         // Absolute lot cap
 input double            InpSLATRmin       = 0.8;          // Min SL distance (xATR)
 input double            InpSLATRmax       = 4.0;          // Max SL distance (xATR)
-input double            InpMaxExtensionATR= 2.0;          // Max chase distance (xATR)
 
 //=== Drawdown Protection ============================================
 input group "=== Drawdown Protection ==="
 input double            InpMaxDailyLossPct  = 3.0;        // Daily loss limit %
 input double            InpMaxWeeklyLossPct = 6.0;        // Weekly loss limit %
 input double            InpMaxDrawdownPct   = 15.0;       // Max drawdown % (equity peak)
+input int               InpDDHaltDays       = 5;          // DD breaker pause days (then resume)
 input int               InpMaxConsecLoss    = 4;          // Consecutive losses -> cooldown
 input int               InpCooldownMin      = 180;        // Cooldown minutes
-input bool              InpCloseAllOnMaxDD  = false;      // Flatten all at DD limit
 
 //=== Overtrading Protection =========================================
 input group "=== Overtrading Protection ==="
-input int               InpMaxTradesPerDay  = 6;          // Max new entries per day
-input int               InpMinTradeGapMin   = 20;         // Min minutes between entries
+input int               InpMaxTradesPerDay  = 12;         // Max new entries per day
+input int               InpMinTradeGapMin   = 5;          // Min minutes between normal entries
 input int               InpMaxPositions     = 1;          // Max simultaneous positions
 input int               InpSameSetupBars    = 24;         // Block same setup within N bars
 
-//=== Filters: Spread / Session / News ===============================
+//=== Filters ========================================================
 input group "=== Filters ==="
-input double            InpMaxSpreadPts   = 50.0;         // Max spread (points)
-input bool              InpUseSessions    = true;         // Use session filter
-input bool              InpUseSydney      = false;        // Trade Sydney
-input int               InpSydneyStart    = 0;            // Sydney start hour (server)
-input int               InpSydneyEnd      = 9;            // Sydney end hour
-input bool              InpUseTokyo       = false;        // Trade Tokyo/Asia
-input int               InpTokyoStart     = 0;            // Tokyo start hour
-input int               InpTokyoEnd       = 9;            // Tokyo end hour
-input bool              InpUseLondon      = true;         // Trade London
-input int               InpLondonStart    = 8;            // London start hour
-input int               InpLondonEnd      = 17;           // London end hour
-input bool              InpUseNY          = true;         // Trade New York
-input int               InpNYStart        = 13;           // NY start hour
-input int               InpNYEnd          = 22;           // NY end hour
-input bool              InpUsePause       = false;        // Daily no-trade window
-input int               InpPauseStart     = 23;           // Pause start hour
-input int               InpPauseEnd       = 1;            // Pause end hour
+input double            InpMaxSpreadPts   = 60.0;         // Max spread (points @0.01)
 input int               InpFridayStopHour = 21;           // No new entries Friday after (0=off)
 input int               InpFridayCloseHour= 22;           // Close all Friday at (0=off)
-input bool              InpUseNews        = true;         // Use news protection
-input int               InpNewsBeforeMin  = 30;           // Block N min before news
-input int               InpNewsAfterMin   = 30;           // Block N min after news
-input string            InpNewsHours      = "13:30,15:00,19:00"; // Fixed news times (HH:MM,...)
+input bool              InpUseNewsTimes   = true;         // Use news windows (trading mode)
+input int               InpNewsBeforeMin  = 30;           // Window opens N min before
+input int               InpNewsAfterMin   = 30;           // Window closes N min after
+input string            InpNewsHours      = "13:30,15:00,19:00"; // News times HH:MM (server)
 
 //=== Volatility Model ===============================================
 input group "=== Volatility Model ==="
 input int               InpATRPeriod      = 14;           // ATR period
 input int               InpATRAvgBars     = 200;          // ATR baseline bars
-input double            InpVolLowRatio    = 0.55;         // Low vol ratio (ATR / baseline)
+input double            InpVolLowRatio    = 0.55;         // Low vol ratio = NO TRADE threshold
 input double            InpVolHighRatio   = 1.60;         // High vol ratio
 input double            InpVolExtremeRatio= 2.50;         // Extreme vol ratio
 input double            InpAbnormalBarATR = 6.0;          // Abnormal single bar (xATR)
 
-//=== Trend Model ====================================================
-input group "=== Trend Model ==="
+//=== Trend / Structure ==============================================
+input group "=== Trend Structure ==="
 input int               InpADXPeriod      = 14;           // ADX period
 input int               InpEmaFastH       = 50;           // HTF fast EMA
 input int               InpEmaSlowH       = 200;          // HTF slow EMA
@@ -127,39 +105,15 @@ input int               InpEmaZoneM       = 50;           // Entry medium EMA
 input int               InpEmaZoneS       = 200;          // Entry slow EMA
 input double            InpStrengthStrong = 60.0;         // Strong trend threshold
 input double            InpStrengthWeak   = 35.0;         // Weak trend threshold
-
-//=== Structure / Range / Breakout ===================================
-input group "=== Structure Range Breakout ==="
 input int               InpSwingStrength  = 3;            // Swing strength (bars/side)
 input int               InpSwingLookback  = 120;          // Swing scan lookback bars
-input int               InpRSIPeriod      = 14;           // RSI period (divergence)
+input int               InpRSIPeriod      = 14;           // RSI period
 input int               InpRangeLookback  = 90;           // Range window bars
 input double            InpRangeMinATR    = 2.5;          // Min range width (xATR)
 input double            InpRangeMaxATR    = 12.0;         // Max range width (xATR)
 input double            InpADXRangeMax    = 20.0;         // Max ADX for range
-input double            InpBOMinATR       = 0.15;         // Breakout close margin (xATR)
+input double            InpBOMinATR       = 0.15;         // Breakout margin (xATR)
 input int               InpBOMinTouches   = 2;            // Min boundary touches
-input double            InpRangeEdgePct   = 0.25;         // Range edge zone depth
-
-//=== Pullback Model =================================================
-input group "=== Pullback Model ==="
-input double            InpPBMinATR       = 0.8;          // Min retrace (xATR)
-input double            InpPBMaxATR       = 4.0;          // Max retrace (xATR)
-input double            InpPBZoneATR      = 1.5;          // EMA zone width (xATR)
-input int               InpPBLook         = 24;           // Impulse lookback bars
-
-//=== Trade Management ===============================================
-input group "=== Trade Management ==="
-input bool              InpUseBE          = true;         // Use break-even
-input double            InpBETriggerATR   = 1.0;          // BE trigger (xATR profit)
-input double            InpBEOffsetPts    = 20.0;         // BE lock offset (points)
-input bool              InpUseTrailing    = true;         // Use ATR trailing stop
-input double            InpTrailStartATR  = 1.2;          // Trail start (xATR profit)
-input double            InpTrailATR       = 1.5;          // Trail distance (xATR)
-input bool              InpUsePartial     = true;         // Use partial profit taking
-input double            InpPartialR       = 1.0;          // Partial at R multiple
-input double            InpPartialPct     = 50.0;         // Partial close percent
-input bool              InpUseSmartExit   = true;         // Smart exit on condition flip
 
 //=== Dashboard & Logging ============================================
 input group "=== Dashboard and Logging ==="
@@ -187,23 +141,23 @@ datetime g_lastSkipLogTime = 0;
 string   g_lastSignalLine = "no signal";
 string   g_lastActionLine = "initialized";
 string   g_statusExtra = "";
+ENUM_MODE g_mode = MODE_SIDE;
 bool     g_statsDirty = true;
-// anti overtrading: last entry identity
+// news stop-and-reverse state
+datetime g_newsKey = 0;
+int      g_newsReversals = 0;
+// anti overtrading
 ENUM_STRATEGY g_lastEntryStrat = STRAT_NONE;
 ENUM_SIGNAL_DIR g_lastEntryDir = SIG_NONE;
 datetime g_lastEntryBarTime = 0;
-// friday close-all once flag
 int      g_fridayClosedDay = -1;
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                            |
-//+------------------------------------------------------------------+
 int OnInit()
   {
-   // sanity checks
    if(PeriodSeconds(InpHTF) <= PeriodSeconds(InpEntryTF))
      {
-      Print("XGE: HTF must be higher than Entry TF. Please fix inputs.");
+      Print("XGE: HTF must be higher than Entry TF.");
       return(INIT_PARAMETERS_INCORRECT);
      }
    if(InpRiskPercent <= 0.0 && InpFixedLot <= 0.0)
@@ -213,9 +167,8 @@ int OnInit()
      }
    if(StringFind(_Symbol, "XAU") < 0 && StringFind(_Symbol, "GOLD") < 0 &&
       StringFind(_Symbol, "Gold") < 0)
-      Print("XGE warning: this EA is designed for XAUUSD/GOLD. Current symbol: ", _Symbol);
+      Print("XGE warning: designed for XAUUSD/GOLD. Symbol: ", _Symbol);
 
-   // configure modules
    g_mkt.m_atrPeriod = InpATRPeriod;
    g_mkt.m_adxPeriod = InpADXPeriod;
    g_mkt.m_rsiPeriod = InpRSIPeriod;
@@ -237,27 +190,10 @@ int OnInit()
    g_mkt.m_rangeMaxATR = InpRangeMaxATR;
    g_mkt.m_boMinATR = InpBOMinATR;
    g_mkt.m_boMinTouches = InpBOMinTouches;
-   g_mkt.m_pbMinATR = InpPBMinATR;
-   g_mkt.m_pbMaxATR = InpPBMaxATR;
-   g_mkt.m_pbZoneATR = InpPBZoneATR;
-   g_mkt.m_pbLook = InpPBLook;
 
-   g_strat.m_useTrend = InpUseTrend;
-   g_strat.m_usePullback = InpUsePullback;
-   g_strat.m_useBreakout = InpUseBreakout;
-   g_strat.m_useRetest = InpUseRetest;
-   g_strat.m_useRange = InpUseRange;
-   g_strat.m_useReversal = InpUseReversal;
-   g_strat.m_useSweep = InpUseSweep;
-   g_strat.m_minRR = InpMinRR;
-   g_strat.m_rrTP = InpRRTP;
    g_strat.m_slATRmin = InpSLATRmin;
    g_strat.m_slATRmax = InpSLATRmax;
-   g_strat.m_extMaxATR = InpMaxExtensionATR;
-   g_strat.m_revMinConf = InpRevMinConf;
-   g_strat.m_rangeEdgePct = InpRangeEdgePct;
-   g_strat.m_boMinTouches = InpBOMinTouches;
-   g_strat.m_ltf = InpEntryTF;
+   g_strat.m_swingFresh = InpSwingFresh;
 
    g_risk.m_riskPct = InpRiskPercent;
    g_risk.m_fixedLot = InpFixedLot;
@@ -265,16 +201,15 @@ int OnInit()
    g_risk.m_maxDailyLossPct = InpMaxDailyLossPct;
    g_risk.m_maxWeeklyLossPct = InpMaxWeeklyLossPct;
    g_risk.m_maxDDPct = InpMaxDrawdownPct;
+   g_risk.m_ddHaltDays = InpDDHaltDays;
    g_risk.m_maxConsecLoss = InpMaxConsecLoss;
    g_risk.m_cooldownMin = InpCooldownMin;
    g_risk.m_maxTradesDay = InpMaxTradesPerDay;
    g_risk.m_minTradeGapMin = InpMinTradeGapMin;
    g_risk.m_maxPositions = InpMaxPositions;
-   g_risk.m_closeAllOnMaxDD = InpCloseAllOnMaxDD;
    g_risk.Init(InpMagic);
 
    g_tm.Init(InpMagic, InpSlippagePts);
-
    if(!g_mkt.Init(InpHTF, InpEntryTF))
       return(INIT_FAILED);
 
@@ -284,17 +219,12 @@ int OnInit()
 
    if(InpFileLog)
       OpenLog();
-
    EventSetTimer(1);
-   Print("XGE: ", XGE_NAME, " v", XGE_VERSION, " initialized on ", _Symbol,
-         " HTF=", EnumToString(InpHTF), " EntryTF=", EnumToString(InpEntryTF),
-         " magic=", InpMagic);
+   Print("XGE v2 initialized on ", _Symbol, " EntryTF=", EnumToString(InpEntryTF),
+         " magic=", InpMagic, " | regime trading: UP=HL/HH DOWN=LH/LL SIDE=S/R NEWS=trail+reverse");
    return(INIT_SUCCEEDED);
   }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization                                          |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
    EventKillTimer();
@@ -308,23 +238,18 @@ void OnDeinit(const int reason)
    Comment("");
   }
 
-//+------------------------------------------------------------------+
-//| Tick: new-bar detection + fast management                        |
-//+------------------------------------------------------------------+
 void OnTick()
   {
-   // manage positions at most once per server second
    datetime now = TimeCurrent();
    if(now != g_lastManageTime)
      {
       g_lastManageTime = now;
       if(g_ready)
         {
-         ManageOpenTrades();
+         ManagePass(now);
          WeekendAndFridayControl();
         }
      }
-   // new entry-TF bar => full analysis cycle
    datetime bt = iTime(_Symbol, InpEntryTF, 0);
    if(bt != 0 && bt != g_lastBarTime)
      {
@@ -333,9 +258,6 @@ void OnTick()
      }
   }
 
-//+------------------------------------------------------------------+
-//| Timer: dashboard + stats                                         |
-//+------------------------------------------------------------------+
 void OnTimer()
   {
    if(g_statsDirty)
@@ -347,15 +269,30 @@ void OnTimer()
       UpdateDashboard();
   }
 
-//+------------------------------------------------------------------+
-//| Trade transactions -> mark stats dirty                           |
-//+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
   {
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
       g_statsDirty = true;
+  }
+
+//+------------------------------------------------------------------+
+//| Regime selection: only LOW VOL stays out                          |
+//+------------------------------------------------------------------+
+ENUM_MODE CurrentMode(const SMarketState &st, const datetime now)
+  {
+   if(st.vol == VOL_LOW)
+      return(MODE_NOVOL);
+   if(InpUseNewsTimes && InpUseNewsMode && NewsWindowKey(now) != 0)
+      return(MODE_NEWS);
+   if(st.structure == STRUCT_BULL ||
+      (st.ltfTrend == TREND_UP && st.structure != STRUCT_BEAR))
+      return(MODE_UP);
+   if(st.structure == STRUCT_BEAR ||
+      (st.ltfTrend == TREND_DOWN && st.structure != STRUCT_BULL))
+      return(MODE_DOWN);
+   return(MODE_SIDE);
   }
 
 //+------------------------------------------------------------------+
@@ -375,150 +312,243 @@ void OnNewBar()
      }
    g_statusExtra = "";
    g_risk.RefreshStats();
-
    const SMarketState st = g_mkt.st;
+   datetime now = TimeCurrent();
 
-   // 1) collect strategy candidates
+   // 1) regime
+   g_mode = CurrentMode(st, now);
+
+   // 2) structure-driven exits for open positions
+   StructureExits(st, now);
+   if(g_mode == MODE_NOVOL)
+     {
+      g_lastSignalLine = "LOW VOLATILITY - standing aside (only no-trade state)";
+      LogSkip("Low volatility - no trade");
+      UpdateDashboard();
+      return;
+     }
+   if(g_mode == MODE_NEWS)
+     {
+      g_lastSignalLine = "NEWS WINDOW - momentum + trailing stop-and-reverse active";
+      UpdateDashboard();
+      return;   // news entries are handled in ManagePass
+     }
+
+   // 3) regime entries
+   if(g_risk.OpenPositions() > 0)
+     {
+      UpdateDashboard();
+      return;
+     }
    SSignal sigs[];
    ArrayResize(sigs, XGE_MAX_SIGNALS);
-   int sigCount = g_strat.BuildSignals(st, sigs);
-
-   // 2) direction permissions
-   int kept = 0;
-   for(int i = 0; i < sigCount; i++)
+   int sigCount = g_strat.BuildSignals(st, g_mode, sigs);
+   if(sigCount == 0)
      {
-      if(sigs[i].dir == SIG_BUY && !InpAllowBuy)
-         continue;
-      if(sigs[i].dir == SIG_SELL && !InpAllowSell)
-         continue;
-      sigs[kept] = sigs[i];
-      kept++;
+      g_lastSignalLine = StringFormat("%s - waiting for setup", ModeText(g_mode));
+      UpdateDashboard();
+      return;
      }
-   sigCount = kept;
-
-   // 3) conflict resolution
-   SSignal best;
-   best.dir = SIG_NONE;
-   best.strat = STRAT_NONE;
-   best.conf = 0.0;
-   best.sl = 0.0; best.tp = 0.0;
-   best.reason = ""; best.key = "";
-   bool haveBuy = false, haveSell = false;
-   for(int i = 0; i < sigCount; i++)
-     {
-      if(sigs[i].dir == SIG_BUY) haveBuy = true;
-      if(sigs[i].dir == SIG_SELL) haveSell = true;
+   SSignal best = sigs[0];
+   for(int i = 1; i < sigCount; i++)
       if(sigs[i].conf > best.conf)
          best = sigs[i];
-     }
-   bool conflict = (haveBuy && haveSell);
-   if(conflict)
+   if(best.dir == SIG_BUY && !InpAllowBuy)
      {
-      g_lastSignalLine = "CONFLICTING SIGNALS (BUY vs SELL) - standing aside";
-      LogSkip("Conflicting strategy signals");
+      LogSkip("Buy disabled");
+      UpdateDashboard();
+      return;
+     }
+   if(best.dir == SIG_SELL && !InpAllowSell)
+     {
+      LogSkip("Sell disabled");
       UpdateDashboard();
       return;
      }
 
-   if(best.dir == SIG_NONE)
-     {
-      g_lastSignalLine = StringFormat("no setup | condition=%s", ConditionText(st.condition));
-      UpdateDashboard();
-      return;
-     }
-
-   // 4) protective gates
+   // 4) protective gates (risk/spread/overtrading only - regimes always tradable)
    string reason = "";
-   if(!PassGates(best, st, reason))
+   if(!PassGates(best, reason))
      {
-      g_lastSignalLine = StringFormat("%s %s conf=%.0f BLOCKED: %s",
-                                      DirText(best.dir), StrategyText(best.strat),
-                                      best.conf, reason);
+      g_lastSignalLine = StringFormat("%s BLOCKED: %s", DirText(best.dir), reason);
       LogSkip(reason);
       UpdateDashboard();
       return;
      }
-
-   // 5) same-setup guard (anti repetition)
+   // same-setup guard
    if(best.strat == g_lastEntryStrat && best.dir == g_lastEntryDir && g_lastEntryBarTime > 0)
      {
       int barsSince = iBarShift(_Symbol, InpEntryTF, g_lastEntryBarTime, false);
       if(barsSince >= 0 && barsSince < InpSameSetupBars)
         {
-         reason = StringFormat("Same setup repeated within %d bars", InpSameSetupBars);
-         g_lastSignalLine = StringFormat("%s %s BLOCKED: %s",
-                                         DirText(best.dir), StrategyText(best.strat), reason);
-         LogSkip(reason);
+         LogSkip("Same setup repeated");
          UpdateDashboard();
          return;
         }
      }
 
-   // 6) sizing
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double refPx = (best.dir == SIG_BUY) ? ask : bid;
-   double slDist = (best.dir == SIG_BUY) ? (refPx - best.sl) : (best.sl - refPx);
-   if(slDist <= 0.0)
-     {
-      LogSkip("Invalid SL distance at entry");
-      UpdateDashboard();
-      return;
-     }
-   string sizeErr = "";
-   double lot = g_risk.CalcLots(slDist, sizeErr);
-   if(lot <= 0.0 || sizeErr != "")
-     {
-      g_lastSignalLine = "sizing failed: " + sizeErr;
-      LogSkip("Sizing failed: " + sizeErr);
-      UpdateDashboard();
-      return;
-     }
-   if(!g_risk.MarginSafe(lot, best.dir == SIG_BUY))
-     {
-      LogSkip("Insufficient free margin");
-      UpdateDashboard();
-      return;
-     }
-
-   // 7) execute
-   string cmt = InpComment + "|" + StrategyCode(best.strat) + "|" +
-                IntegerToString((int)MathRound(best.conf));
-   if(StringLen(cmt) > 31)
-      cmt = StringSubstr(cmt, 0, 31);
-   uint retcode = 0;
-   double openPx = 0.0;
-   bool ok = g_tm.OpenPosition(best.dir, lot, best.sl, best.tp, cmt, retcode, openPx);
-   if(ok)
-     {
-      g_risk.m_lastEntryTime = TimeCurrent();
-      g_lastEntryStrat = best.strat;
-      g_lastEntryDir = best.dir;
-      g_lastEntryBarTime = st.barTime;
-      g_lastActionLine = StringFormat("OPEN %s %s lots=%.2f conf=%.0f",
-                                      DirText(best.dir), StrategyText(best.strat), lot, best.conf);
-      g_lastSignalLine = StringFormat("%s %s conf=%.0f -> EXECUTED lots=%.2f",
-                                      DirText(best.dir), StrategyText(best.strat), best.conf, lot);
-      LogOpen(st, best, lot);
-      Print("XGE TRADE: ", g_lastActionLine, " | condition=", ConditionText(st.condition),
-            " | ", best.reason);
-     }
-   else
-     {
-      ExecutionGuard(retcode);
-      g_lastSignalLine = StringFormat("ORDER FAILED retcode=%d", retcode);
-      LogSkip(StringFormat("Order failed retcode=%d", retcode));
-     }
-   g_statsDirty = true;
+   // 5) execute
+   TryOpen(best.dir, best.sl, best.tp, (int)g_mode, best.reason, false);
    UpdateDashboard();
   }
 
 //+------------------------------------------------------------------+
-//| All protective gates; returns true when trade is allowed         |
+//| Close open positions when their structure target/failure arrives |
 //+------------------------------------------------------------------+
-bool PassGates(const SSignal &sig, const SMarketState &st, string &reason)
+void StructureExits(const SMarketState &st, const datetime now)
   {
-   // terminal / account / symbol permission
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+      int pmode = g_tm.GetMode(tk);
+      long ptype = PositionGetInteger(POSITION_TYPE);
+      bool closeNow = false;
+      string why = "";
+      if(pmode == MODE_UP)
+        {
+         if(st.bullBOS && st.bullBOSBar <= 2)
+           {
+            closeNow = true; why = "HIGHER-HIGH target";
+           }
+         else if(g_mode == MODE_DOWN)
+           {
+            closeNow = true; why = "trend reversed down";
+           }
+        }
+      else if(pmode == MODE_DOWN)
+        {
+         if(st.bearBOS && st.bearBOSBar <= 2)
+           {
+            closeNow = true; why = "LOWER-LOW target";
+           }
+         else if(g_mode == MODE_UP)
+           {
+            closeNow = true; why = "trend reversed up";
+           }
+        }
+      else if(pmode == MODE_SIDE)
+        {
+         if(g_mode == MODE_NEWS || (g_mode == MODE_UP && ptype == POSITION_TYPE_SELL) ||
+            (g_mode == MODE_DOWN && ptype == POSITION_TYPE_BUY))
+           {
+            closeNow = true; why = "regime changed";
+           }
+        }
+      if(closeNow)
+        {
+         if(g_tm.ClosePosition(tk))
+           {
+            g_lastActionLine = "CLOSE #" + IntegerToString((long)tk) + " " + why;
+            LogRow("CLOSE", ptype == POSITION_TYPE_BUY ? "BUY" : "SELL", "Structure",
+                   ModeText(g_mode), why, "");
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Per-second management: emergency, news trailing & stop-reverse    |
+//+------------------------------------------------------------------+
+void ManagePass(const datetime now)
+  {
+   const SMarketState st = g_mkt.st;
+   g_tm.ManageEmergency(st.atrL, InpEmergencyATR);
+
+   if(!InpUseNewsTimes || !InpUseNewsMode)
+      return;
+   double atr = st.atrL;
+   if(atr <= 0.0)
+      return;
+   datetime wkey = NewsWindowKey(now);
+   if(wkey != g_newsKey)
+     {
+      g_newsKey = wkey;
+      g_newsReversals = 0;
+     }
+   double trail = InpNewsTrailATR * atr;
+
+   // manage open news positions: rolling trailing + stop-and-reverse
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0)
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+      if(g_tm.GetMode(tk) != MODE_NEWS)
+         continue;
+      long ptype = PositionGetInteger(POSITION_TYPE);
+      double curSL = PositionGetDouble(POSITION_SL);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+      if(wkey == 0)   // window ended -> flatten news position
+        {
+         if(g_tm.ClosePosition(tk))
+            LogRow("CLOSE", ptype == POSITION_TYPE_BUY ? "BUY" : "SELL", "News",
+                   "NEWS", "news window ended", "");
+         continue;
+        }
+      if(ptype == POSITION_TYPE_BUY)
+        {
+         double tgt = bid - trail;
+         if(tgt > curSL)
+            g_tm.ModifySL(tk, tgt);
+         if(bid <= curSL)   // trailing stop hit -> reverse
+           {
+            g_tm.ClosePosition(tk);
+            LogRow("REVERSE", "BUY", "News", "NEWS", "trailing stop hit, reversing", "");
+            g_newsReversals++;
+            if(g_newsReversals <= InpNewsMaxReversals)
+               TryOpen(SIG_SELL, curSL + trail, 0.0, MODE_NEWS,
+                       "News stop-and-reverse (sell)", true);
+           }
+        }
+      else
+        {
+         double tgt = ask + trail;
+         if(curSL == 0.0 || tgt < curSL)
+            g_tm.ModifySL(tk, tgt);
+         if(ask >= curSL)
+           {
+            g_tm.ClosePosition(tk);
+            LogRow("REVERSE", "SELL", "News", "NEWS", "trailing stop hit, reversing", "");
+            g_newsReversals++;
+            if(g_newsReversals <= InpNewsMaxReversals)
+               TryOpen(SIG_BUY, curSL - trail, 0.0, MODE_NEWS,
+                       "News stop-and-reverse (buy)", true);
+           }
+        }
+     }
+
+   // fresh momentum entry inside a news window (risk gates still apply)
+   if(wkey != 0 && g_risk.OpenPositions() == 0 && g_newsReversals <= InpNewsMaxReversals)
+     {
+      string riskBlock = g_risk.EntryAllowed();
+      double body = st.c1 - st.o1;
+      if(riskBlock == "" && MathAbs(body) >= InpNewsMomentumATR * atr)
+        {
+         ENUM_SIGNAL_DIR dir = (body > 0.0) ? SIG_BUY : SIG_SELL;
+         double sl = (dir == SIG_BUY) ? (st.c1 - trail) : (st.c1 + trail);
+         string why = StringFormat("News momentum %s (body %.2f)", DirText(dir), body);
+         TryOpen(dir, sl, 0.0, MODE_NEWS, why, true);
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Risk / execution gates only (no market-condition filtering)      |
+//+------------------------------------------------------------------+
+bool PassGates(const SSignal &sig, string &reason)
+  {
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
      {
       reason = "Trading disabled in terminal";
@@ -532,130 +562,38 @@ bool PassGates(const SSignal &sig, const SMarketState &st, string &reason)
    long tradeMode = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
    if(tradeMode != SYMBOL_TRADE_MODE_FULL)
      {
-      reason = "Symbol trade mode restricted (close-only?)";
+      reason = "Symbol trade mode restricted";
       return(false);
      }
-   // execution pause after slippage failures
    if(TimeCurrent() < g_execPauseUntil)
      {
-      reason = StringFormat("Execution paused (slippage protection) until %s",
-                            TimeToString(g_execPauseUntil, TIME_MINUTES));
+      reason = "Execution paused (slippage protection)";
       return(false);
      }
-   // spread
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double spreadPts = (point > 0.0) ?
       (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / point : 0.0;
    if(spreadPts > InpMaxSpreadPts)
      {
-      reason = StringFormat("High spread %.0f pts > max %.0f", spreadPts, InpMaxSpreadPts);
+      reason = StringFormat("High spread %.0f pts", spreadPts);
       return(false);
      }
-   // sessions
-   if(InpUseSessions)
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   if(InpFridayStopHour > 0 && dt.day_of_week == 5 && dt.hour >= InpFridayStopHour)
      {
-      string sess = "";
-      if(!SessionAllowed(sess))
-        {
-         reason = "Outside trading session" + (sess != "" ? " (" + sess + ")" : "");
-         return(false);
-        }
-     }
-   // friday stop
-   MqlDateTime dtnow;
-   TimeToStruct(TimeCurrent(), dtnow);
-   if(InpFridayStopHour > 0 && dtnow.day_of_week == 5 && dtnow.hour >= InpFridayStopHour)
-     {
-      reason = "Friday pre-weekend trading stop";
+      reason = "Friday pre-weekend stop";
       return(false);
      }
-   // news
-   string newsWhy = "";
-   if(NewsBlocked(newsWhy))
-     {
-      reason = newsWhy;
-      return(false);
-     }
-   // market condition gates: bad/uncertain/dangerous -> no trade
-   switch(st.condition)
-     {
-      case COND_LOW_VOL:
-         reason = "Low volatility market - no trade";
-         return(false);
-      case COND_EXTREME_VOL:
-         reason = "Extreme volatility - protection mode";
-         return(false);
-      case COND_ABNORMAL:
-         reason = "Abnormal market - protection mode";
-         return(false);
-      case COND_UNCERTAIN:
-         reason = "Uncertain market - waiting";
-         return(false);
-      default:
-         break;
-     }
-   // risk limits
    string riskBlock = g_risk.EntryAllowed();
    if(riskBlock != "")
      {
       reason = riskBlock;
       return(false);
      }
-   // opposite position lock
    if(HasOppositePosition(sig.dir))
      {
       reason = "Opposite position already open";
-      return(false);
-     }
-   // higher timeframe alignment
-   if(InpEnforceHTF)
-     {
-      if(sig.dir == SIG_BUY && st.htfTrend == TREND_DOWN &&
-         !(sig.strat == STRAT_REVERSAL))
-        {
-         reason = "HTF trend is DOWN - buy blocked";
-         return(false);
-        }
-      if(sig.dir == SIG_SELL && st.htfTrend == TREND_UP &&
-         !(sig.strat == STRAT_REVERSAL))
-        {
-         reason = "HTF trend is UP - sell blocked";
-         return(false);
-        }
-     }
-   // counter-trend structure check
-   if(!InpAllowCounter && sig.strat != STRAT_REVERSAL && sig.strat != STRAT_RANGE)
-     {
-      if(sig.dir == SIG_BUY && st.structure == STRUCT_BEAR)
-        {
-         reason = "Bearish structure - counter-trend buy blocked";
-         return(false);
-        }
-      if(sig.dir == SIG_SELL && st.structure == STRUCT_BULL)
-        {
-         reason = "Bullish structure - counter-trend sell blocked";
-         return(false);
-        }
-     }
-   // confidence
-   if(sig.conf < InpMinConfidence)
-     {
-      reason = StringFormat("Confidence %.0f below minimum %.0f", sig.conf, InpMinConfidence);
-      return(false);
-     }
-   // risk:reward sanity
-   double entry = (sig.dir == SIG_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                                       : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double risk = (sig.dir == SIG_BUY) ? entry - sig.sl : sig.sl - entry;
-   double gain = (sig.dir == SIG_BUY) ? sig.tp - entry : entry - sig.tp;
-   if(risk <= 0.0 || gain <= 0.0)
-     {
-      reason = "Invalid SL/TP geometry";
-      return(false);
-     }
-   if(gain / risk < InpMinRR)
-     {
-      reason = StringFormat("Poor risk/reward %.2f < %.2f", gain / risk, InpMinRR);
       return(false);
      }
    reason = "";
@@ -663,8 +601,66 @@ bool PassGates(const SSignal &sig, const SMarketState &st, string &reason)
   }
 
 //+------------------------------------------------------------------+
-//| Slippage / execution failure protection                          |
+//| Size and send an order                                           |
 //+------------------------------------------------------------------+
+void TryOpen(const ENUM_SIGNAL_DIR dir, const double slIn, const double tpIn,
+             const int mode, const string reason, const bool bypassGap)
+  {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double refPx = (dir == SIG_BUY) ? ask : bid;
+   double slDist = (dir == SIG_BUY) ? (refPx - slIn) : (slIn - refPx);
+   if(slDist <= 0.0)
+     {
+      LogSkip("Invalid SL distance");
+      return;
+     }
+   if(!bypassGap && g_risk.m_lastEntryTime > 0 &&
+      (long)(TimeCurrent() - g_risk.m_lastEntryTime) < (long)InpMinTradeGapMin * 60)
+     {
+      LogSkip("Min interval between trades");
+      return;
+     }
+   string sizeErr = "";
+   double lot = g_risk.CalcLots(slDist, sizeErr);
+   if(lot <= 0.0)
+     {
+      LogSkip("Sizing failed: " + sizeErr);
+      return;
+     }
+   if(!g_risk.MarginSafe(lot, dir == SIG_BUY))
+     {
+      LogSkip("Insufficient free margin");
+      return;
+     }
+   string cmt = InpComment + "|" + IntegerToString(mode);
+   if(StringLen(cmt) > 31)
+      cmt = StringSubstr(cmt, 0, 31);
+   uint retcode = 0;
+   double openPx = 0.0;
+   bool ok = g_tm.OpenPosition(dir, lot, slIn, tpIn, cmt, mode, retcode, openPx);
+   if(ok)
+     {
+      g_risk.m_lastEntryTime = TimeCurrent();
+      g_lastEntryStrat = (mode == MODE_NEWS) ? STRAT_TREND : STRAT_PULLBACK;
+      g_lastEntryDir = dir;
+      g_lastEntryBarTime = g_mkt.st.barTime;
+      g_lastActionLine = StringFormat("OPEN %s mode=%s lots=%.2f",
+                                      DirText(dir), ModeText((ENUM_MODE)mode), lot);
+      g_lastSignalLine = StringFormat("%s -> EXECUTED lots=%.2f", DirText(dir), lot);
+      LogRow("OPEN", DirText(dir), ModeText((ENUM_MODE)mode),
+             ConditionText(g_mkt.st.condition), reason,
+             StringFormat("sl=%.2f tp=%.2f lots=%.2f", slIn, tpIn, lot));
+      Print("XGE TRADE: ", g_lastActionLine, " | ", reason);
+     }
+   else
+     {
+      ExecutionGuard(retcode);
+      LogSkip(StringFormat("Order failed retcode=%d", retcode));
+     }
+   g_statsDirty = true;
+  }
+
 void ExecutionGuard(const uint retcode)
   {
    if(retcode == TRADE_RETCODE_REQUOTE || retcode == TRADE_RETCODE_PRICE_CHANGED ||
@@ -672,14 +668,10 @@ void ExecutionGuard(const uint retcode)
       retcode == TRADE_RETCODE_CONNECTION)
      {
       g_execPauseUntil = TimeCurrent() + 120;
-      Print("XGE: execution problem retcode=", retcode,
-            " - new entries paused for 2 minutes");
+      Print("XGE: execution problem retcode=", retcode, " - paused 2 min");
      }
   }
 
-//+------------------------------------------------------------------+
-//| Any EA position in the opposite direction?                       |
-//+------------------------------------------------------------------+
 bool HasOppositePosition(const ENUM_SIGNAL_DIR dir)
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -700,66 +692,7 @@ bool HasOppositePosition(const ENUM_SIGNAL_DIR dir)
    return(false);
   }
 
-//+------------------------------------------------------------------+
-//| Session filter (server time)                                     |
-//+------------------------------------------------------------------+
-bool InHourWindow(const int h, const int start, const int end)
-  {
-   if(start == end)
-      return(false);
-   if(start < end)
-      return(h >= start && h < end);
-   return(h >= start || h < end);   // wrap-around window
-  }
-
-bool SessionAllowed(string &activeName)
-  {
-   MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   int h = dt.hour;
-   activeName = "";
-   // daily pause window has priority
-   if(InpUsePause && InHourWindow(h, InpPauseStart, InpPauseEnd))
-     {
-      activeName = "daily pause";
-      return(false);
-     }
-   if(InpUseSydney && InHourWindow(h, InpSydneyStart, InpSydneyEnd))
-      activeName += (activeName == "" ? "" : "+") + "SYDNEY";
-   if(InpUseTokyo && InHourWindow(h, InpTokyoStart, InpTokyoEnd))
-      activeName += (activeName == "" ? "" : "+") + "TOKYO";
-   if(InpUseLondon && InHourWindow(h, InpLondonStart, InpLondonEnd))
-      activeName += (activeName == "" ? "" : "+") + "LONDON";
-   if(InpUseNY && InHourWindow(h, InpNYStart, InpNYEnd))
-      activeName += (activeName == "" ? "" : "+") + "NEW YORK";
-   return(activeName != "");
-  }
-
-//+------------------------------------------------------------------+
-//| News protection: fixed windows + economic calendar (live)        |
-//| Result cached for 30 seconds to keep the hot path light.         |
-//+------------------------------------------------------------------+
-bool NewsBlocked(string &why)
-  {
-   if(!InpUseNews)
-      return(false);
-   static datetime s_lastCheck = 0;
-   static bool     s_lastResult = false;
-   static string   s_lastWhy = "";
-   datetime now = TimeCurrent();
-   if(s_lastCheck != 0 && (long)(now - s_lastCheck) < 30)
-     {
-      why = s_lastWhy;
-      return(s_lastResult);
-     }
-   bool res = ComputeNewsBlock(now, why);
-   s_lastCheck = now;
-   s_lastResult = res;
-   s_lastWhy = why;
-   return(res);
-  }
-
-//--- trim spaces without relying on StringTrim* return-type quirks
+//=== News window detection ==========================================
 string TrimSpaces(const string s)
   {
    int b = 0, e = StringLen(s);
@@ -772,14 +705,15 @@ string TrimSpaces(const string s)
    return(StringSubstr(s, b, e - b));
   }
 
-bool ComputeNewsBlock(const datetime now, string &why)
+//--- key of the active news window (event time), 0 = no window
+datetime NewsWindowKey(const datetime now)
   {
+   if(!InpUseNewsTimes)
+      return(0);
    MqlDateTime dt;
    TimeToStruct(now, dt);
    dt.hour = 0; dt.min = 0; dt.sec = 0;
    datetime day0 = StructToTime(dt);
-
-   // 1) fixed daily news windows (backtest friendly)
    string parts[];
    int n = StringSplit(InpNewsHours, ',', parts);
    for(int i = 0; i < n; i++)
@@ -797,40 +731,26 @@ bool ComputeNewsBlock(const datetime now, string &why)
       datetime evT = day0 + (long)hh * 3600 + (long)mm * 60;
       long diffSec = (long)(now - evT);
       if(diffSec >= -(long)InpNewsBeforeMin * 60 && diffSec <= (long)InpNewsAfterMin * 60)
-        {
-         why = StringFormat("News protection: scheduled event %s (window)", hm);
-         return(true);
-        }
+         return(evT);
      }
-   // 2) live economic calendar (high-impact USD events)
    if(MQLInfoInteger(MQL_TESTER) == 0)
      {
       datetime from = now - (long)InpNewsBeforeMin * 60;
       datetime to = now + (long)InpNewsAfterMin * 60;
       CalendarValue values[];
       int cnt = CalendarValueHistory(values, from, to, NULL, "USD");
-      if(cnt > 0)
+      for(int i = 0; i < cnt; i++)
         {
-         for(int i = 0; i < cnt; i++)
-           {
-            MqlCalendarEvent ev;
-            if(CalendarEventById(values[i].event_id, ev) <= 0)
-               continue;
-            if(ev.importance == CALENDAR_IMPORTANCE_HIGH)
-              {
-               why = StringFormat("News protection: high-impact USD event at %s",
-                                  TimeToString((datetime)values[i].time, TIME_MINUTES));
-               return(true);
-              }
-           }
+         MqlCalendarEvent ev;
+         if(CalendarEventById(values[i].event_id, ev) <= 0)
+            continue;
+         if(ev.importance == CALENDAR_IMPORTANCE_HIGH)
+            return((datetime)values[i].time);
         }
      }
-   return(false);
+   return(0);
   }
 
-//+------------------------------------------------------------------+
-//| Friday close-all + weekend safety                                |
-//+------------------------------------------------------------------+
 void WeekendAndFridayControl(void)
   {
    if(InpFridayCloseHour <= 0)
@@ -853,7 +773,6 @@ void WeekendAndFridayControl(void)
       else
          g_fridayClosedDay = dt.day_of_year;
      }
-   // emergency flatten at max drawdown
    if(g_risk.m_ddHalt && g_risk.m_closeAllOnMaxDD && !g_risk.m_ddFlattened)
      {
       if(g_risk.OpenPositions() > 0)
@@ -863,26 +782,11 @@ void WeekendAndFridayControl(void)
            {
             g_risk.m_ddFlattened = true;
             Print("XGE: EMERGENCY FLATTEN at max drawdown");
-            LogRow("CLOSE_ALL", "max-drawdown-protection", "", "", "", msg);
            }
         }
       else
          g_risk.m_ddFlattened = true;
      }
-  }
-
-//+------------------------------------------------------------------+
-//| Position management pass                                         |
-//+------------------------------------------------------------------+
-void ManageOpenTrades(void)
-  {
-   const SMarketState st = g_mkt.st;
-   bool tighten = (st.vol == VOL_EXTREME || st.vol == VOL_ABNORMAL);
-   g_tm.ManagePositions(st,
-                        InpUseBE, InpBETriggerATR, InpBEOffsetPts,
-                        InpUseTrailing, InpTrailStartATR, InpTrailATR,
-                        InpUsePartial, InpPartialR, InpPartialPct,
-                        InpUseSmartExit, tighten);
   }
 
 //=== Logging ========================================================
@@ -913,19 +817,8 @@ void LogRow(const string action, const string dir, const string strat,
              Sanitize(details) + (extra != "" ? " | " + Sanitize(extra) : ""));
   }
 
-void LogOpen(const SMarketState &st, const SSignal &sig, const double lot)
-  {
-   string details = StringFormat("conf=%.0f lot=%.2f sl=%.2f tp=%.2f | %s | cond=%s struct=%s vol=%s htf=%s",
-                                 sig.conf, lot, sig.sl, sig.tp, sig.reason,
-                                 ConditionText(st.condition), StructureText(st.structure),
-                                 VolText(st.vol), TrendText(st.htfTrend));
-   LogRow("OPEN", DirText(sig.dir), StrategyText(sig.strat), ConditionText(st.condition),
-          details, "");
-  }
-
 void LogSkip(const string reason)
   {
-   // throttle identical skip messages
    if(reason == g_lastSkipReason && TimeCurrent() - g_lastSkipLogTime < 600)
       return;
    g_lastSkipReason = reason;
@@ -948,89 +841,60 @@ void UpdateDashboard(void)
 
    string statusTxt = "ACTIVE";
    color  statusClr = clrLime;
-   if(g_risk.m_ddHalt)      { statusTxt = "HALTED: MAX DRAWDOWN"; statusClr = clrRed; }
-   else if(g_risk.m_dailyHalt){ statusTxt = "HALTED: DAILY LOSS LIMIT"; statusClr = clrRed; }
-   else if(g_risk.m_weeklyHalt){ statusTxt = "HALTED: WEEKLY LOSS LIMIT"; statusClr = clrRed; }
+   if(g_risk.m_ddHalt)        { statusTxt = "HALTED: MAX DRAWDOWN"; statusClr = clrRed; }
+   else if(g_risk.m_dailyHalt){ statusTxt = "HALTED: DAILY LOSS"; statusClr = clrRed; }
+   else if(g_risk.m_weeklyHalt){ statusTxt = "HALTED: WEEKLY LOSS"; statusClr = clrRed; }
+   else if(g_risk.m_ddReduced){ statusTxt = "REDUCED RISK: RECOVERING"; statusClr = clrGold; }
    else if(TimeCurrent() < g_risk.m_cooldownUntil) { statusTxt = "COOLDOWN"; statusClr = clrOrange; }
-   else if(!g_ready)        { statusTxt = "WAITING FOR DATA"; statusClr = clrYellow; }
-   else if(st.condition == COND_UNCERTAIN || st.condition == COND_LOW_VOL)
-     { statusTxt = "STANDING ASIDE"; statusClr = clrYellow; }
+   else if(!g_ready)          { statusTxt = "WAITING FOR DATA"; statusClr = clrYellow; }
+   else if(g_mode == MODE_NOVOL) { statusTxt = "NO TRADE: LOW VOL"; statusClr = clrYellow; }
 
-   lines[n] = XGE_NAME + "  v" + XGE_VERSION;            clrs[n] = clrWhite; n++;
-   lines[n] = "EA Status     : " + statusTxt + (g_statusExtra != "" ? " (" + g_statusExtra + ")" : "");
-   clrs[n] = statusClr; n++;
-   lines[n] = StringFormat("Condition     : %s (age %d bars)", ConditionText(st.condition), st.condAge);
-   clrs[n] = clrDeepSkyBlue; n++;
-   if(g_mkt.m_transition != "")
-     {
-      lines[n] = "Transition    : " + g_mkt.m_transition;
-      clrs[n] = clrDimGray; n++;
-     }
+   lines[n] = XGE_NAME + "  v" + XGE_VERSION;                 clrs[n] = clrWhite; n++;
+   lines[n] = "EA Status     : " + statusTxt;                 clrs[n] = statusClr; n++;
+   lines[n] = "Mode          : " + ModeText(g_mode);          clrs[n] = clrDeepSkyBlue; n++;
    lines[n] = StringFormat("Trend         : HTF %s | Entry %s", TrendText(st.htfTrend), TrendText(st.ltfTrend));
-   clrs[n] = clrWhiteSmoke; n++;
-   lines[n] = StringFormat("Trend Strength: %.0f / 100%s", st.trendStrength,
-                           st.trendStrength >= InpStrengthStrong ? " (STRONG)" :
-                           (st.trendStrength >= InpStrengthWeak ? " (WEAK)" : ""));
    clrs[n] = clrWhiteSmoke; n++;
    string hhll = "";
    if(st.flagHH) hhll += "HH ";
    if(st.flagHL) hhll += "HL ";
    if(st.flagLH) hhll += "LH ";
    if(st.flagLL) hhll += "LL ";
-   string bos = "";
-   if(st.bullBOS && st.bullBOSBar <= 5) bos = StringFormat(" | BOS-UP %db", st.bullBOSBar);
-   if(st.bearBOS && st.bearBOSBar <= 5) bos = StringFormat(" | BOS-DN %db", st.bearBOSBar);
-   lines[n] = "Structure     : " + StructureText(st.structure) + " " + hhll + bos;
+   lines[n] = "Structure     : " + StructureText(st.structure) + " " + hhll;
    clrs[n] = clrWhiteSmoke; n++;
    lines[n] = StringFormat("Volatility    : %s (ATR %.2f, ratio %.2f)", VolText(st.vol),
                            st.atrL, st.volRatio);
-   clrs[n] = (st.vol == VOL_NORMAL ? clrLime : (st.vol == VOL_LOW ? clrYellow : clrOrangeRed));
-   n++;
+   clrs[n] = (st.vol == VOL_LOW ? clrYellow : clrLime); n++;
    if(st.rangeValid)
      {
       lines[n] = StringFormat("Range         : %.2f - %.2f (pos %.2f)", st.rangeLow, st.rangeHigh, st.rangePos);
       clrs[n] = clrWhiteSmoke; n++;
      }
-   lines[n] = "Signal        : " + g_lastSignalLine;
-   clrs[n] = clrGold; n++;
+   datetime wkey = NewsWindowKey(TimeCurrent());
+   lines[n] = "News          : " + (wkey != 0 ?
+              "WINDOW ACTIVE since " + TimeToString(wkey, TIME_MINUTES) +
+              StringFormat(" (reversals %d/%d)", g_newsReversals, InpNewsMaxReversals) : "no window");
+   clrs[n] = (wkey != 0 ? clrOrange : clrWhiteSmoke); n++;
+   lines[n] = "Signal        : " + g_lastSignalLine;          clrs[n] = clrGold; n++;
    string bias = "NEUTRAL";
    color biasClr = clrDimGray;
    if(st.htfTrend == TREND_UP && st.ltfTrend != TREND_DOWN) { bias = "BULLISH"; biasClr = clrLime; }
    else if(st.htfTrend == TREND_DOWN && st.ltfTrend != TREND_UP) { bias = "BEARISH"; biasClr = clrTomato; }
-   lines[n] = "Buy/Sell Bias : " + bias;                       clrs[n] = biasClr; n++;
+   lines[n] = "Buy/Sell Bias : " + bias;                      clrs[n] = biasClr; n++;
    int posCnt = g_risk.OpenPositions();
    lines[n] = StringFormat("Trade Status  : %d position(s), floating %+.2f", posCnt, g_risk.FloatingPL());
    clrs[n] = (g_risk.FloatingPL() >= 0.0) ? clrLime : clrTomato; n++;
-   string riskTxt;
-   if(InpFixedLot > 0.0)
-      riskTxt = StringFormat("Fixed lot %.2f", InpFixedLot);
-   else
-     {
-      double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-      riskTxt = StringFormat("%.2f%% (~%.2f %s)", InpRiskPercent,
-                             bal * InpRiskPercent / 100.0, AccountInfoString(ACCOUNT_CURRENCY));
-     }
-   lines[n] = "Risk/Trade    : " + riskTxt;                     clrs[n] = clrWhiteSmoke; n++;
-   lines[n] = StringFormat("Daily P/L     : %+.2f (%.2f%%)", g_risk.DailyPL(),
-                           g_risk.m_dayStartBalance > 0 ? g_risk.DailyPL() / g_risk.m_dayStartBalance * 100.0 : 0.0);
+   lines[n] = StringFormat("Risk/Trade    : %.2f%%", InpRiskPercent);
+   clrs[n] = clrWhiteSmoke; n++;
+   lines[n] = StringFormat("Daily P/L     : %+.2f", g_risk.DailyPL());
    clrs[n] = (g_risk.DailyPL() >= 0.0) ? clrLime : clrTomato; n++;
    lines[n] = StringFormat("Drawdown      : %.2f%% (limit %.1f%%)", g_risk.DrawdownPct(), InpMaxDrawdownPct);
    clrs[n] = (g_risk.DrawdownPct() > InpMaxDrawdownPct * 0.6) ? clrOrange : clrWhiteSmoke; n++;
-   string sess = "";
-   SessionAllowed(sess);
-   lines[n] = "Session       : " + (sess == "" ? "CLOSED" : sess);
-   clrs[n] = (sess == "" ? clrTomato : clrWhiteSmoke); n++;
-   string newsWhy = "";
-   bool newsNow = NewsBlocked(newsWhy);
-   lines[n] = "News          : " + (newsNow ? "BLOCKED - " + newsWhy : "CLEAR");
-   clrs[n] = newsNow ? clrOrange : clrWhiteSmoke; n++;
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double spreadPts = (point > 0.0) ?
       (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / point : 0.0;
    lines[n] = StringFormat("Spread        : %.0f pts (max %.0f)", spreadPts, InpMaxSpreadPts);
    clrs[n] = (spreadPts > InpMaxSpreadPts) ? clrTomato : clrWhiteSmoke; n++;
-   lines[n] = "Last Action   : " + g_lastActionLine;
-   clrs[n] = clrAqua; n++;
+   lines[n] = "Last Action   : " + g_lastActionLine;          clrs[n] = clrAqua; n++;
 
    g_dash.Update(lines, clrs, n);
   }

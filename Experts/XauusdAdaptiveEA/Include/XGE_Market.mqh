@@ -75,6 +75,8 @@ public:
       m_nBars = 0;
       ZeroMemory(st);
       st.condition = COND_UNCERTAIN;
+      st.sh0Age = 9999;
+      st.sl0Age = 9999;
      }
 
    //--- create all indicator handles
@@ -322,6 +324,9 @@ private:
             st.slCount++;
            }
         }
+      // confirmation age of the newest swings in bars (0 = just confirmed)
+      st.sh0Age = (st.shCount > 0) ? (int)MathMax(0, st.sh[0].bar - k) : 9999;
+      st.sl0Age = (st.slCount > 0) ? (int)MathMax(0, st.sl[0].bar - k) : 9999;
      }
 
    void DetectStructure(void)

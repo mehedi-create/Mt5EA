@@ -31,6 +31,10 @@ public:
    int      m_maxPositions;       // max simultaneous positions of this EA
    long     m_magic;
    bool     m_closeAllOnMaxDD;    // emergency flatten at DD limit
+   int      m_ddHaltDays;         // DD breaker: pause days, then reset peak
+   double   m_ddRiskMult;         // risk multiplier while recovering from DD halt
+   double   m_ddTripPeak;         // equity peak at the moment the breaker tripped
+   bool     m_ddReduced;          // true = trade at reduced risk until full recovery
    // state
    double   m_peakEquity;
    double   m_realizedToday, m_realizedWeek;
@@ -42,6 +46,7 @@ public:
    datetime m_cooldownUntil;
    bool     m_dailyHalt, m_weeklyHalt, m_ddHalt;
    bool     m_ddFlattened;
+   datetime m_ddHaltTime;
    datetime m_statStamp;
 
    CRiskManager(void)
@@ -50,7 +55,9 @@ public:
       m_maxDailyLossPct = 3.0; m_maxWeeklyLossPct = 6.0; m_maxDDPct = 15.0;
       m_maxConsecLoss = 4; m_cooldownMin = 180;
       m_maxTradesDay = 6; m_minTradeGapMin = 20; m_maxPositions = 1;
-      m_magic = 0; m_closeAllOnMaxDD = false;
+      m_magic = 0; m_closeAllOnMaxDD = false; m_ddHaltDays = 5;
+      m_ddRiskMult = 0.5; m_ddTripPeak = 0.0; m_ddReduced = false;
+      m_ddHaltTime = 0;
       m_peakEquity = 0.0;
       m_realizedToday = 0.0; m_realizedWeek = 0.0;
       m_dayStartBalance = 0.0; m_weekStartBalance = 0.0;
@@ -171,7 +178,31 @@ public:
       if(eq > m_peakEquity)
          m_peakEquity = eq;
       double ddPct = (m_peakEquity > 0.0) ? (m_peakEquity - eq) / m_peakEquity * 100.0 : 0.0;
-      m_ddHalt = (ddPct >= m_maxDDPct);
+      // recoverable drawdown circuit breaker: pause, then restart from a fresh peak
+      if(!m_ddHalt && ddPct >= m_maxDDPct)
+        {
+         m_ddHalt = true;
+         m_ddHaltTime = now;
+         m_ddTripPeak = m_peakEquity;     // recovery target for reduced-risk mode
+         Print("XGE: max-drawdown breaker tripped at ", DoubleToString(ddPct, 2),
+               "% - pausing new entries for ", m_ddHaltDays, " days");
+        }
+      else if(m_ddHalt && (long)(now - m_ddHaltTime) >= (long)m_ddHaltDays * 86400)
+        {
+         m_ddHalt = false;
+         m_ddFlattened = false;
+         m_ddReduced = true;              // resume at reduced risk until recovery
+         m_peakEquity = eq;   // fresh baseline after the breaker pause
+         Print("XGE: drawdown breaker released - resuming at ",
+               DoubleToString(m_ddRiskMult * 100.0, 0), "% risk until equity recovers to ",
+               DoubleToString(m_ddTripPeak, 2));
+        }
+      // full recovery: back above the pre-trip peak -> restore normal risk
+      if(m_ddReduced && m_ddTripPeak > 0.0 && eq >= m_ddTripPeak)
+        {
+         m_ddReduced = false;
+         Print("XGE: equity recovered to pre-halt peak - full risk restored");
+        }
       m_dailyHalt = (m_dayStartBalance > 0.0 &&
                      DailyPL() <= -m_maxDailyLossPct / 100.0 * m_dayStartBalance);
       m_weeklyHalt = (m_weekStartBalance > 0.0 &&
@@ -229,7 +260,8 @@ public:
          double bal = AccountInfoDouble(ACCOUNT_BALANCE);
          double eq = AccountInfoDouble(ACCOUNT_EQUITY);
          double base = MathMin(bal, eq);        // never size off inflated equity
-         double riskMoney = base * m_riskPct / 100.0;
+         double pct = m_riskPct * (m_ddReduced ? m_ddRiskMult : 1.0);
+         double riskMoney = base * pct / 100.0;
          double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
          double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
          if(tickValue <= 0.0 || tickSize <= 0.0)
