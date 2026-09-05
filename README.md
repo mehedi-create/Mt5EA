@@ -49,33 +49,6 @@ News windows default to 13:30 / 15:00 / 19:00 server time (±30 min), tunable.
 - Friday entry stop + weekend flatten, emergency exit on 5×ATR adverse move
 - Every entry reason and every skip reason is logged (CSV + Experts log)
 
-### Included backtests (1 year, real XM broker data)
-
-`backtest/` contains a faithful Python mirror of the EA
-([`backtest/xge_backtest.py`](backtest/xge_backtest.py)) run on 1 year of XAUUSD
-(2025-08-21 → 2026-08-21, warmed up on 3.7 years of prior history), $10,000 start, 1% risk:
-
-| Config | Net | Trades | PF | Max DD | Report |
-|---|---|---|---|---|---|
-| **M15** (recommended) | **+24.92%** | 1,962 | 1.04 | 22.96% | [`REPORT.md`](backtest/REPORT.md) |
-| **M5 hybrid** (HTF regime) | **+63.37%** | 2,385 | 1.08 | 22.62% | [`REPORT_m5_hybrid.md`](backtest/REPORT_m5_hybrid.md) |
-| M5 raw (v2.0 detection) | −24.80% | 2,793 | 0.95 | 39.96% | [`REPORT_m5.md`](backtest/REPORT_m5.md) |
-
-**v2.1 detection upgrade:** M5 charts previously mis-detected trends because 3-bar
-windows become 15-minute windows and micro-swings pollute structure. v2.1 fixes this with
-(1) an **amplitude-filtered swing model** (a swing only counts when it is ≥ 0.5×ATR beyond
-the previous opposite swing — improves M15 *and* M5) and (2) an **HTF-anchored regime**
-for M5: trend/S&R come from completed M15 swings while entry timing stays on M5. Do **not**
-run raw v2.0 logic on M5 — it loses to spread costs and noise.
-
-Honest caveats on the M5 number: it comes from the trail-2.0 configuration and M5 results
-are sensitive to the news trail distance (1.5×→+28%, 1.8–2.0×→+63/+68%, 2.5×→+21% on this
-one year). Treat the M5 figure as optimistic until re-validated in the MT5 Strategy Tester
-on out-of-sample data; the M15 configuration is the more robust one.
-
-This is a **simulation approximation**, not an MT5 tester run. Always validate in the
-MT5 Strategy Tester ("Every tick based on real ticks") before any live use.
-
 See [`Experts/XauusdAdaptiveEA/README.md`](Experts/XauusdAdaptiveEA/README.md) for installation, parameters and backtesting guidance.
 
 > **Disclaimer:** Trading involves substantial risk of loss. This software is provided as-is, with no warranty and no profit guarantee. Past backtest results do not guarantee future performance. Always backtest and forward-test on a demo account before live use.
