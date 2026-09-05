@@ -29,6 +29,8 @@ public:
    int      m_emaFastH, m_emaSlowH;            // HTF trend EMAs
    int      m_emaZoneF, m_emaZoneM, m_emaZoneS;// entry TF EMAs
    int      m_swingStrength, m_swingLookback;
+   double   m_swingMinATR;           // min swing amplitude (xATR); 0 = off
+   bool     m_useHTFRegime;          // anchor regime on HTF (v2.1, for M5)
    int      m_atrAvgBars;
    double   m_volLowRatio, m_volHighRatio, m_volExtremeRatio, m_abnormalBarATR;
    double   m_adxStrong, m_adxWeak, m_adxRangeMax;
@@ -62,6 +64,7 @@ public:
       m_emaFastH = 50; m_emaSlowH = 200;
       m_emaZoneF = 20; m_emaZoneM = 50; m_emaZoneS = 200;
       m_swingStrength = 3; m_swingLookback = 120;
+      m_swingMinATR = 0.5; m_useHTFRegime = true;
       m_atrAvgBars = 200;
       m_volLowRatio = 0.55; m_volHighRatio = 1.60;
       m_volExtremeRatio = 2.50; m_abnormalBarATR = 6.0;
@@ -77,6 +80,10 @@ public:
       st.condition = COND_UNCERTAIN;
       st.sh0Age = 9999;
       st.sl0Age = 9999;
+      st.htfStructure = STRUCT_UNDEF;
+      st.htfRegimeValid = false;
+      st.htfSupport = 0.0;
+      st.htfResistance = 0.0;
      }
 
    //--- create all indicator handles
@@ -158,6 +165,7 @@ public:
       ClassifyVolatility();
       DetectSwings();
       DetectStructure();
+      AnalyzeHTF();
       DetectBOS();
       ClassifyTrends();
       DetectRange();
@@ -295,10 +303,15 @@ private:
       st.slCount = 0;
       int k = m_swingStrength;
       int last = MathMin(m_swingLookback, m_nBars - k - 2);
-      for(int i = k; i <= last; i++)
+      // 1) collect raw pivots oldest -> newest (series index: larger = older)
+      int    pBar[];
+      double pPx[];
+      bool   pIsH[];
+      ArrayResize(pBar, 0);
+      ArrayResize(pPx, 0);
+      ArrayResize(pIsH, 0);
+      for(int i = last; i >= k; i--)
         {
-         if(st.shCount >= 4 && st.slCount >= 4)
-            break;
          bool isH = true, isL = true;
          for(int j = 1; j <= k; j++)
            {
@@ -309,24 +322,158 @@ private:
             if(!isH && !isL)
                break;
            }
-         if(isH && st.shCount < 4)
+         if(!isH && !isL)
+            continue;
+         int sz = ArraySize(pBar);
+         ArrayResize(pBar, sz + 1);
+         ArrayResize(pPx, sz + 1);
+         ArrayResize(pIsH, sz + 1);
+         pBar[sz] = i;
+         pPx[sz]  = isH ? m_high[i] : m_low[i];
+         pIsH[sz] = isH;
+        }
+      // 2) amplitude filter (zigzag style): a swing only counts when it is
+      //    at least m_swingMinATR x ATR beyond the previous opposite swing
+      int    accHBar[], accLBar[];
+      double accHPx[], accLPx[];
+      ArrayResize(accHBar, 0); ArrayResize(accHPx, 0);
+      ArrayResize(accLBar, 0); ArrayResize(accLPx, 0);
+      double lastH = 0.0, lastL = 0.0;
+      bool   haveH = false, haveL = false;
+      for(int p = 0; p < ArraySize(pBar); p++)
+        {
+         int    bi = pBar[p];
+         double a  = (m_swingMinATR > 0.0 && bi < m_nBars) ? m_swingMinATR * m_atrBuf[bi] : 0.0;
+         if(pIsH[p])
            {
-            st.sh[st.shCount].bar = i;
-            st.sh[st.shCount].time = m_time[i];
-            st.sh[st.shCount].price = m_high[i];
-            st.shCount++;
+            if(m_swingMinATR <= 0.0 || !haveL || (pPx[p] - lastL) >= a)
+              {
+               haveH = true; lastH = pPx[p];
+               int s = ArraySize(accHBar);
+               ArrayResize(accHBar, s + 1); ArrayResize(accHPx, s + 1);
+               accHBar[s] = bi; accHPx[s] = pPx[p];
+              }
            }
-         if(isL && st.slCount < 4)
+         else
            {
-            st.sl[st.slCount].bar = i;
-            st.sl[st.slCount].time = m_time[i];
-            st.sl[st.slCount].price = m_low[i];
-            st.slCount++;
+            if(m_swingMinATR <= 0.0 || !haveH || (lastH - pPx[p]) >= a)
+              {
+               haveL = true; lastL = pPx[p];
+               int s = ArraySize(accLBar);
+               ArrayResize(accLBar, s + 1); ArrayResize(accLPx, s + 1);
+               accLBar[s] = bi; accLPx[s] = pPx[p];
+              }
            }
+        }
+      // 3) newest-first output (max 4 per side)
+      int ch = ArraySize(accHBar);
+      st.shCount = MathMin(4, ch);
+      for(int x = 0; x < st.shCount; x++)
+        {
+         int src = ch - 1 - x;
+         st.sh[x].bar   = accHBar[src];
+         st.sh[x].time  = m_time[accHBar[src]];
+         st.sh[x].price = accHPx[src];
+        }
+      int cl = ArraySize(accLBar);
+      st.slCount = MathMin(4, cl);
+      for(int x2 = 0; x2 < st.slCount; x2++)
+        {
+         int src = cl - 1 - x2;
+         st.sl[x2].bar   = accLBar[src];
+         st.sl[x2].time  = m_time[accLBar[src]];
+         st.sl[x2].price = accLPx[src];
         }
       // confirmation age of the newest swings in bars (0 = just confirmed)
       st.sh0Age = (st.shCount > 0) ? (int)MathMax(0, st.sh[0].bar - k) : 9999;
       st.sl0Age = (st.slCount > 0) ? (int)MathMax(0, st.sl[0].bar - k) : 9999;
+     }
+
+   //--- v2.1: HTF-anchored regime for lower-TF charts (e.g. M5 entries).
+   //    Structure + S/R from amplitude-filtered HTF swings; uses only
+   //    completed HTF bars (index >= 1), so there is no lookahead.
+   void AnalyzeHTF(void)
+     {
+      st.htfRegimeValid = false;
+      st.htfStructure   = STRUCT_UNDEF;
+      st.htfSupport     = 0.0;
+      st.htfResistance  = 0.0;
+      if(!m_useHTFRegime)
+         return;
+      if(PeriodSeconds(m_htf) <= PeriodSeconds(m_ltf))
+         return;
+      int nH = 300;
+      if(Bars(_Symbol, m_htf) < nH + 10)
+         return;
+      MqlRates hr[];
+      ArraySetAsSeries(hr, true);
+      if(CopyRates(_Symbol, m_htf, 0, nH, hr) < nH)
+         return;
+      double ha[];
+      if(!CopyInd(m_hATR, 0, nH, ha))
+         return;
+      int k = m_swingStrength;
+      double amp = m_swingMinATR;
+      double lastH = 0.0, lastL = 0.0;
+      bool   haveH = false, haveL = false;
+      double hPx[4]; int nHs = 0;
+      double lPx[4]; int nLs = 0;
+      // sweep oldest -> newest over completed HTF bars
+      for(int i = nH - 1; i >= k + 1; i--)
+        {
+         bool isH = true, isL = true;
+         for(int j = 1; j <= k; j++)
+           {
+            if(hr[i].high <= hr[i - j].high || hr[i].high <= hr[i + j].high)
+               isH = false;
+            if(hr[i].low >= hr[i - j].low || hr[i].low >= hr[i + j].low)
+               isL = false;
+            if(!isH && !isL)
+               break;
+           }
+         double a = (amp > 0.0 && ha[i] > 0.0) ? amp * ha[i] : 0.0;
+         if(isH && (amp <= 0.0 || !haveL || (hr[i].high - lastL) >= a))
+           {
+            haveH = true; lastH = hr[i].high;
+            if(nHs < 4)
+              {
+               hPx[nHs] = hr[i].high; nHs++;
+              }
+            else
+              {
+               for(int x = 0; x < 3; x++) { hPx[x] = hPx[x + 1]; }
+               hPx[3] = hr[i].high;
+              }
+           }
+         if(isL && (amp <= 0.0 || !haveH || (lastH - hr[i].low) >= a))
+           {
+            haveL = true; lastL = hr[i].low;
+            if(nLs < 4)
+              {
+               lPx[nLs] = hr[i].low; nLs++;
+              }
+            else
+              {
+               for(int x = 0; x < 3; x++) { lPx[x] = lPx[x + 1]; }
+               lPx[3] = hr[i].low;
+              }
+           }
+        }
+      if(nHs < 2 || nLs < 2)
+         return;
+      st.htfRegimeValid = true;
+      st.htfResistance  = hPx[nHs - 1];     // newest accepted HTF swing high
+      st.htfSupport     = lPx[nLs - 1];     // newest accepted HTF swing low
+      bool fHH = (hPx[nHs - 1] > hPx[nHs - 2]);
+      bool fLH = (hPx[nHs - 1] < hPx[nHs - 2]);
+      bool fHL = (lPx[nLs - 1] > lPx[nLs - 2]);
+      bool fLL = (lPx[nLs - 1] < lPx[nLs - 2]);
+      if(fHH && fHL)
+         st.htfStructure = STRUCT_BULL;
+      else if(fLH && fLL)
+         st.htfStructure = STRUCT_BEAR;
+      else
+         st.htfStructure = STRUCT_MIXED;
      }
 
    void DetectStructure(void)

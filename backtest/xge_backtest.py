@@ -50,6 +50,9 @@ P = dict(
     friday_stop_hour=16, friday_close_hour=16,
     start_balance=10000.0, contract=100.0, lot_step=0.01, min_lot=0.01,
     dd_risk_mult=0.5,
+    # v2.1 regime detection upgrades
+    swing_min_atr=0.5,   # min swing amplitude (xATR); 0 = off
+    hybrid=False,        # HTF(M15)-anchored regime for M5 entries
 )
 
 VOL_ABN, VOL_LOW, VOL_NORM, VOL_HIGH, VOL_EXT = range(5)
@@ -102,7 +105,8 @@ def load_data(tf="m15"):
 
 
 class Market:
-    def __init__(self, m15, h1):
+    def __init__(self, m15, h1, tf="m15"):
+        self.tf = tf
         self.t = m15.index.values
         self.o = m15["open"].values.astype(float)
         self.h = m15["high"].values.astype(float)
@@ -128,6 +132,67 @@ class Market:
                 isl[j] = True
         self.is_sh = ish
         self.is_sl = isl
+        self.ht_struct = None
+        self.ht_trend = None
+        self.ht_sup = None
+        self.ht_res = None
+        if P["hybrid"] and tf == "m5":
+            self.build_htf(m15)
+
+    def build_htf(self, df):
+        """HTF (M15) regime: swing structure + EMA trend, amplitude-filtered,
+        mapped onto every M5 bar using only COMPLETED HTF bars (no lookahead)."""
+        htd = df.resample("15min").agg({"open": "first", "high": "max", "low": "min",
+                                        "close": "last"}).dropna()
+        hh = htd["high"].values.astype(float)
+        hl = htd["low"].values.astype(float)
+        hc = htd["close"].values.astype(float)
+        nht = len(hc)
+        k = P["swing_strength"]
+        atrh = atr_wilder(hh, hl, hc, P["atr_period"])
+        ema20h = ema(hc, P["ema_zone_f"]); ema50h = ema(hc, P["ema_zone_m"])
+        ish = np.zeros(nht, bool); isl = np.zeros(nht, bool)
+        for j in range(k, nht - k):
+            nh = max(hh[j - k:j].max(), hh[j + 1:j + k + 1].max())
+            nl = min(hl[j - k:j].min(), hl[j + 1:j + k + 1].min())
+            if hh[j] > nh: ish[j] = True
+            if hl[j] < nl: isl[j] = True
+        shq = deque(); slq = deque()
+        struct = np.full(nht, STRUCT_UNDEF)
+        sup = np.full(nht, np.nan); res = np.full(nht, np.nan)
+        sma = P["swing_min_atr"]
+        for j in range(nht):
+            jj = j - k
+            if jj >= k:
+                amp = sma * atrh[jj] if (sma > 0 and atrh[jj] == atrh[jj]) else 0.0
+                if ish[jj] and (amp <= 0 or not slq or (hh[jj] - slq[-1][1]) >= amp):
+                    shq.append((jj, hh[jj]))
+                    if len(shq) > 4: shq.popleft()
+                if isl[jj] and (amp <= 0 or not shq or (shq[-1][1] - hl[jj]) >= amp):
+                    slq.append((jj, hl[jj]))
+                    if len(slq) > 4: slq.popleft()
+            sh2 = list(shq)[-2:]; sl2 = list(slq)[-2:]
+            if len(sh2) >= 2 and len(sl2) >= 2:
+                if sh2[-1][1] > sh2[-2][1] and sl2[-1][1] > sl2[-2][1]:
+                    struct[j] = STRUCT_BULL
+                elif sh2[-1][1] < sh2[-2][1] and sl2[-1][1] < sl2[-2][1]:
+                    struct[j] = STRUCT_BEAR
+                else:
+                    struct[j] = STRUCT_MIXED
+            if slq: sup[j] = slq[-1][1]
+            if shq: res[j] = shq[-1][1]
+        ht_trend = np.full(nht, TREND_NONE)
+        up = (ema20h > ema50h) & (hc > ema50h); dn = (ema20h < ema50h) & (hc < ema50h)
+        ht_trend[up] = TREND_UP; ht_trend[dn] = TREND_DOWN
+        ht_close = htd.index.values + np.timedelta64(15, "m")
+        idx = np.clip(np.searchsorted(ht_close, self.t, side="right") - 1, 0, nht - 1)
+        self.ht_struct = struct[idx]
+        self.ht_trend = ht_trend[idx]
+        self.ht_sup = sup[idx]
+        self.ht_res = res[idx]
+        bad = self.t < ht_close[0]
+        self.ht_struct[bad] = STRUCT_UNDEF
+        self.ht_trend[bad] = TREND_NONE
 
 
 def news_key(ts):
@@ -233,14 +298,15 @@ def run(m, eval_start):
             realized_week = 0.0
             weekly_halt = False
 
-        # confirm swings
+        # confirm swings (optionally amplitude-filtered to kill micro-swings)
         j = t - k
         if j >= k:
-            if m.is_sh[j]:
+            amp = P["swing_min_atr"] * atr[j] if (P["swing_min_atr"] > 0 and atr[j] == atr[j]) else 0.0
+            if m.is_sh[j] and (amp <= 0 or not sl_q or (h[j] - sl_q[-1][1]) >= amp):
                 sh_q.append((j, h[j]))
                 if len(sh_q) > 4: sh_q.popleft()
                 bos_bull_i = None
-            if m.is_sl[j]:
+            if m.is_sl[j] and (amp <= 0 or not sh_q or (sh_q[-1][1] - l[j]) >= amp):
                 sl_q.append((j, l[j]))
                 if len(sl_q) > 4: sl_q.popleft()
                 bos_bear_i = None
@@ -297,7 +363,19 @@ def run(m, eval_start):
         if nk != news_win:
             news_win = nk
             reversals = 0
-        if vol == VOL_LOW:
+        if P["hybrid"]:
+            hts = m.ht_struct[t]; htt = m.ht_trend[t]
+            if vol == VOL_LOW:
+                mode = MODE_NOVOL
+            elif nk is not None:
+                mode = MODE_NEWS
+            elif hts == STRUCT_BULL or (htt == TREND_UP and hts != STRUCT_BEAR):
+                mode = MODE_UP
+            elif hts == STRUCT_BEAR or (htt == TREND_DOWN and hts != STRUCT_BULL):
+                mode = MODE_DOWN
+            else:
+                mode = MODE_SIDE
+        elif vol == VOL_LOW:
             mode = MODE_NOVOL
         elif nk is not None:
             mode = MODE_NEWS
@@ -423,9 +501,15 @@ def run(m, eval_start):
                 if dd <= P["sl_atr_max"] * a:
                     sig = (SIG_SELL, MODE_DOWN, c[t] + dd, 0.0,
                            f"LH sell sh0={sh[0][1]:.2f}<sh1={sh[1][1]:.2f}", "TR")
-        elif mode == MODE_SIDE and len(sh) >= 1 and len(sl) >= 1:
-            support, resist = sl[0][1], sh[0][1]
-            if resist > support:
+        elif mode == MODE_SIDE:
+            support = resist = None
+            if P["hybrid"]:
+                supv, resv = m.ht_sup[t], m.ht_res[t]
+                if supv == supv and resv == resv and resv > supv:
+                    support, resist = supv, resv
+            elif len(sh) >= 1 and len(sl) >= 1:
+                support, resist = sl[0][1], sh[0][1]
+            if support is not None and resist > support:
                 if l[t] <= support + P["sr_zone_atr"] * a and c[t] > o[t]:
                     dd = max(c[t] - (support - 0.3 * a), P["sl_atr_min"] * a)
                     if dd <= P["sl_atr_max"] * a:
@@ -560,13 +644,31 @@ def main():
         P.update(dict(swing_fresh=9, swing_lookback=360, range_lookback=270,
                       same_setup_bars=72, atr_avg_bars=600, swing_strength=9))
         print("preset rt: bar-based windows scaled x3 for real-time equivalence")
+    if preset == "hybrid":
+        # v2.1 M5 config: HTF(M15)-anchored regime + amplitude-filtered M5
+        # swings + stronger news momentum filter / wider trail / 2 flips max
+        P.update(dict(hybrid=True, swing_min_atr=0.5, swing_fresh=5,
+                      news_momentum_atr=1.0, news_trail_atr=2.0,
+                      news_max_reversals=2))
+        print("preset hybrid: M15 regime + filtered M5 swings + M5 news params")
+    for ov in sys.argv[3:]:
+        if "=" in ov:
+            kk, vv = ov.split("=", 1)
+            oldv = P.get(kk)
+            if isinstance(oldv, bool):
+                P[kk] = vv.lower() in ("1", "true")
+            elif isinstance(oldv, int):
+                P[kk] = int(vv)
+            else:
+                P[kk] = float(vv)
+            print(f"override {kk}={P[kk]}")
     suffix = "" if tf == "m15" else ("_m5" if preset == "" else f"_m5_{preset}")
     print("Loading data...")
     ent, h1 = load_data(tf)
     end = ent.index[-1]
     eval_start = (end - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
     print(f"Eval window: {eval_start} .. {end.strftime('%Y-%m-%d')} | {tf.upper()} bars {len(ent)}")
-    m = Market(ent, h1)
+    m = Market(ent, h1, tf)
     import time as _t
     t0 = _t.time()
     res = run(m, eval_start)
@@ -662,6 +764,39 @@ def main():
         L.append("|---|---|---|---|")
         for s, row in bym.iterrows():
             L.append(f"| {s} | {int(row.trades)} | {row.wr:.0f}% | {row.pnl:+,.2f} |")
+        L.append("")
+        L.append("## Detailed per-mode breakdown")
+        L.append("")
+        L.append("| Mode | Trades | Win% | P/L ($) | Avg win | Avg loss | Best trade | Worst trade | Avg hold (min) |")
+        L.append("|---|---|---|---|---|---|---|---|---|")
+        for mo, grp in rows.groupby("mode_txt"):
+            wins_ = grp[grp.pnl > 0]; losses_ = grp[grp.pnl <= 0]
+            aw = wins_.pnl.mean() if len(wins_) else 0.0
+            al = losses_.pnl.mean() if len(losses_) else 0.0
+            if len(grp):
+                bt = grp.loc[grp.pnl.idxmax()]; wt = grp.loc[grp.pnl.idxmin()]
+                hold = ((pd.DatetimeIndex(grp.exit_time) - pd.DatetimeIndex(grp.entry_time))
+                        .total_seconds() / 60.0)
+                btxt = f"{bt.pnl:+,.0f} ({pd.Timestamp(bt.entry_time):%m-%d %H:%M},{'BUY' if bt['dir']==1 else 'SELL'})"
+                wtxt = f"{wt.pnl:+,.0f} ({pd.Timestamp(wt.entry_time):%m-%d %H:%M},{'BUY' if wt['dir']==1 else 'SELL'})"
+                htxt = f"{float(pd.Series(hold).mean()):.0f}"
+            else:
+                btxt = wtxt = htxt = "-"
+            L.append(f"| {mo} | {len(grp)} | {100*len(wins_)/max(len(grp),1):.0f}% | {grp.pnl.sum():+,.2f} | "
+                     f"{aw:+,.2f} | {al:+,.2f} | {btxt} | {wtxt} | {htxt} |")
+        L.append("")
+        L.append("### Per-mode exits (P/L $, count)")
+        L.append("")
+        exits = ["HIGHER_HIGH", "LOWER_LOW", "NEWS_END", "TP", "REGIME_CHG", "TREND_REV",
+                 "WEEKEND", "EMERGENCY", "SL", "TRAIL_STOP"]
+        L.append("| Mode | " + " | ".join(exits) + " |")
+        L.append("|---|" + "---|" * len(exits))
+        for mo, grp in rows.groupby("mode_txt"):
+            cells = []
+            for e in exits:
+                sub = grp[grp.why == e]
+                cells.append(f"{sub.pnl.sum():+,.0f} ({len(sub)})" if len(sub) else "-")
+            L.append(f"| {mo} | " + " | ".join(cells) + " |")
         L.append("")
         byw = rows.groupby("why").agg(trades=("pnl", "size"), pnl=("pnl", "sum"))
         L.append("## By exit reason")

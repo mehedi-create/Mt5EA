@@ -136,10 +136,19 @@ private:
    int SigSide(const SMarketState &st, SSignal &sigs[], int n)
      {
       int n0 = n;
-      if(st.slCount < 1 || st.shCount < 1)
-         return(0);
-      double support = st.sl[0].price;
-      double resist = st.sh[0].price;
+      double support, resist;
+      if(st.htfRegimeValid)                       // v2.1: HTF-anchored S/R
+        {
+         support = st.htfSupport;
+         resist  = st.htfResistance;
+        }
+      else
+        {
+         if(st.slCount < 1 || st.shCount < 1)
+            return(0);
+         support = st.sl[0].price;
+         resist  = st.sh[0].price;
+        }
       if(resist <= support)
          return(0);
       // buy near support with a bullish reaction candle

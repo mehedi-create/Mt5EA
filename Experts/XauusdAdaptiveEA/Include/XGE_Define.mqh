@@ -142,6 +142,10 @@ struct SMarketState
    SSwing   sh[4];                   // swing highs, [0] = most recent
    SSwing   sl[4];                   // swing lows
    int      sh0Age, sl0Age;          // bars since newest swing got confirmed
+   // HTF regime (v2.1): structure/S&R anchored on the higher timeframe
+   ENUM_STRUCTURE htfStructure;
+   double   htfSupport, htfResistance;
+   bool     htfRegimeValid;
    bool     bullBOS, bearBOS;        // break of structure events
    int      bullBOSBar, bearBOSBar;  // bars ago
    bool     chochBull, chochBear;    // change of character

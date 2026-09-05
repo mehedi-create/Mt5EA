@@ -40,8 +40,11 @@ input bool              InpAllowSell      = true;         // Allow SELL trades
 
 //=== Timeframes =====================================================
 input group "=== Timeframes ==="
-input ENUM_TIMEFRAMES   InpHTF            = PERIOD_H1;    // Higher TF (context/bias)
+input ENUM_TIMEFRAMES   InpHTF            = PERIOD_M15;   // Higher TF (regime anchor; keep > entry TF)
 input ENUM_TIMEFRAMES   InpEntryTF        = PERIOD_M15;   // Entry TF (signals)
+input bool              InpUseHTFRegime   = true;         // Anchor regime/S&R on HTF (best for M5)
+input double            InpSwingMinATR    = 0.5;          // Min swing size (xATR) to count (0=off)
+input bool              InpAutoM5Preset   = true;         // On M5 charts auto-apply M5-tuned params
 
 //=== Regime trading =================================================
 input group "=== Regime Trading ==="
@@ -142,6 +145,11 @@ string   g_lastSignalLine = "no signal";
 string   g_lastActionLine = "initialized";
 string   g_statusExtra = "";
 ENUM_MODE g_mode = MODE_SIDE;
+// effective (possibly M5-preset) parameters
+double   g_effNewsTrail     = 1.2;
+double   g_effNewsMomentum  = 0.4;
+int      g_effNewsMaxRev    = 3;
+int      g_effSwingFresh    = 3;
 bool     g_statsDirty = true;
 // news stop-and-reverse state
 datetime g_newsKey = 0;
@@ -190,10 +198,32 @@ int OnInit()
    g_mkt.m_rangeMaxATR = InpRangeMaxATR;
    g_mkt.m_boMinATR = InpBOMinATR;
    g_mkt.m_boMinTouches = InpBOMinTouches;
+   g_mkt.m_swingMinATR = InpSwingMinATR;
+   g_mkt.m_useHTFRegime = (InpUseHTFRegime &&
+                           PeriodSeconds(InpHTF) > PeriodSeconds(InpEntryTF));
+
+   //--- v2.1: M5 auto preset (validated on the 1-year M5 backtest)
+   g_effNewsTrail    = InpNewsTrailATR;
+   g_effNewsMomentum = InpNewsMomentumATR;
+   g_effNewsMaxRev   = InpNewsMaxReversals;
+   g_effSwingFresh   = InpSwingFresh;
+   if(InpEntryTF == PERIOD_M5 && InpAutoM5Preset)
+     {
+      if(InpNewsMomentumATR == 0.4)  g_effNewsMomentum = 1.0;
+      if(InpNewsTrailATR == 1.2)     g_effNewsTrail = 2.0;
+      if(InpNewsMaxReversals == 3)   g_effNewsMaxRev = 2;
+      if(InpSwingFresh == 3)         g_effSwingFresh = 5;
+      Print("XGE: M5 entry TF - auto preset applied (news momentum ",
+            DoubleToString(g_effNewsMomentum, 1), "xATR, trail ",
+            DoubleToString(g_effNewsTrail, 1), "xATR, max reversals ",
+            g_effNewsMaxRev, ", swing fresh ", g_effSwingFresh,
+            " bars). NOTE: M5 results are sensitive to the news trail",
+            " distance - validate in the Strategy Tester.");
+     }
 
    g_strat.m_slATRmin = InpSLATRmin;
    g_strat.m_slATRmax = InpSLATRmax;
-   g_strat.m_swingFresh = InpSwingFresh;
+   g_strat.m_swingFresh = g_effSwingFresh;
 
    g_risk.m_riskPct = InpRiskPercent;
    g_risk.m_fixedLot = InpFixedLot;
@@ -286,11 +316,12 @@ ENUM_MODE CurrentMode(const SMarketState &st, const datetime now)
       return(MODE_NOVOL);
    if(InpUseNewsTimes && InpUseNewsMode && NewsWindowKey(now) != 0)
       return(MODE_NEWS);
-   if(st.structure == STRUCT_BULL ||
-      (st.ltfTrend == TREND_UP && st.structure != STRUCT_BEAR))
+   // v2.1: prefer HTF-anchored structure/trend when available (M5 charts)
+   ENUM_STRUCTURE s = st.htfRegimeValid ? st.htfStructure : st.structure;
+   ENUM_TREND_DIR t = st.htfRegimeValid ? st.htfTrend : st.ltfTrend;
+   if(s == STRUCT_BULL || (t == TREND_UP && s != STRUCT_BEAR))
       return(MODE_UP);
-   if(st.structure == STRUCT_BEAR ||
-      (st.ltfTrend == TREND_DOWN && st.structure != STRUCT_BULL))
+   if(s == STRUCT_BEAR || (t == TREND_DOWN && s != STRUCT_BULL))
       return(MODE_DOWN);
    return(MODE_SIDE);
   }
@@ -471,7 +502,7 @@ void ManagePass(const datetime now)
       g_newsKey = wkey;
       g_newsReversals = 0;
      }
-   double trail = InpNewsTrailATR * atr;
+   double trail = g_effNewsTrail * atr;
 
    // manage open news positions: rolling trailing + stop-and-reverse
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -507,7 +538,7 @@ void ManagePass(const datetime now)
             g_tm.ClosePosition(tk);
             LogRow("REVERSE", "BUY", "News", "NEWS", "trailing stop hit, reversing", "");
             g_newsReversals++;
-            if(g_newsReversals <= InpNewsMaxReversals)
+            if(g_newsReversals <= g_effNewsMaxRev)
                TryOpen(SIG_SELL, curSL + trail, 0.0, MODE_NEWS,
                        "News stop-and-reverse (sell)", true);
            }
@@ -522,7 +553,7 @@ void ManagePass(const datetime now)
             g_tm.ClosePosition(tk);
             LogRow("REVERSE", "SELL", "News", "NEWS", "trailing stop hit, reversing", "");
             g_newsReversals++;
-            if(g_newsReversals <= InpNewsMaxReversals)
+            if(g_newsReversals <= g_effNewsMaxRev)
                TryOpen(SIG_BUY, curSL - trail, 0.0, MODE_NEWS,
                        "News stop-and-reverse (buy)", true);
            }
@@ -530,11 +561,11 @@ void ManagePass(const datetime now)
      }
 
    // fresh momentum entry inside a news window (risk gates still apply)
-   if(wkey != 0 && g_risk.OpenPositions() == 0 && g_newsReversals <= InpNewsMaxReversals)
+   if(wkey != 0 && g_risk.OpenPositions() == 0 && g_newsReversals <= g_effNewsMaxRev)
      {
       string riskBlock = g_risk.EntryAllowed();
       double body = st.c1 - st.o1;
-      if(riskBlock == "" && MathAbs(body) >= InpNewsMomentumATR * atr)
+      if(riskBlock == "" && MathAbs(body) >= g_effNewsMomentum * atr)
         {
          ENUM_SIGNAL_DIR dir = (body > 0.0) ? SIG_BUY : SIG_SELL;
          double sl = (dir == SIG_BUY) ? (st.c1 - trail) : (st.c1 + trail);
@@ -872,7 +903,7 @@ void UpdateDashboard(void)
    datetime wkey = NewsWindowKey(TimeCurrent());
    lines[n] = "News          : " + (wkey != 0 ?
               "WINDOW ACTIVE since " + TimeToString(wkey, TIME_MINUTES) +
-              StringFormat(" (reversals %d/%d)", g_newsReversals, InpNewsMaxReversals) : "no window");
+              StringFormat(" (reversals %d/%d)", g_newsReversals, g_effNewsMaxRev) : "no window");
    clrs[n] = (wkey != 0 ? clrOrange : clrWhiteSmoke); n++;
    lines[n] = "Signal        : " + g_lastSignalLine;          clrs[n] = clrGold; n++;
    string bias = "NEUTRAL";
