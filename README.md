@@ -34,6 +34,17 @@ Experts/XauusdAdaptiveEA/
 - **Full transparency:** on-chart dashboard + CSV decision log (every trade *and* every skip is explained)
 - **Backtest friendly:** all logic price-derived; fixed news windows for the tester; no lookahead
 
+### Included backtest (1 year)
+
+`backtest/` contains a faithful Python mirror of the EA
+([`backtest/xge_backtest.py`](backtest/xge_backtest.py)) run on 1 year of real XAUUSD M15 data
+(2025-08-21 → 2026-08-21, warmed up on 3.7 years of prior history):
+
+- Net +5.73% with 1%/trade risk; 161 round-turn trades, 52.2% win rate
+- After a ~25% equity run-up, the Nov-2025 gold crash took the account -15.5% from peak;
+  the max-drawdown protection then correctly halted all new entries for the rest of the year
+- Artifacts: [`backtest/REPORT.md`](backtest/REPORT.md), `backtest/equity_curve.png`, `backtest/backtest_trades.csv`
+
 See [`Experts/XauusdAdaptiveEA/README.md`](Experts/XauusdAdaptiveEA/README.md) for installation, parameters and backtesting guidance.
 
 > **Disclaimer:** Trading involves substantial risk of loss. This software is provided as-is, with no warranty and no profit guarantee. Always backtest and forward-test on a demo account before live use.
